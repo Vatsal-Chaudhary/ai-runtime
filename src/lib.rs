@@ -17,6 +17,6 @@ pub use tools::{
 };
 pub use voice::{
     AudioChunk, FakeSpeechToText, FakeTextToSpeech, RuntimeTtsAdapter, SpeechToText, SttError,
-    SttResult, TextToSpeech, TranscriptEvent, TtsAdapterError, TtsError, TtsEvent,
+    SttResult, TextToSpeech, TranscriptEvent, TtsAdapterError, TtsError, TtsEvent, VoiceEvent,
     VoicePipelineRunner, VoiceTurnError, VoiceTurnOptions, VoiceTurnOutput, VoiceTurnRunner,
 };

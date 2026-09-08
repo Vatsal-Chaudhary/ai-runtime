@@ -74,6 +74,38 @@ pub enum TranscriptEvent {
     Done,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VoiceEvent {
+    SttPartial {
+        elapsed_ms: u128,
+        stt_elapsed_ms: u128,
+        transcript_chars: usize,
+    },
+    SttFinal {
+        elapsed_ms: u128,
+        stt_elapsed_ms: u128,
+        transcript_chars: usize,
+    },
+    LlmFirstToken {
+        elapsed_ms: u128,
+        runtime_elapsed_ms: u128,
+    },
+    TtsFirstAudio {
+        elapsed_ms: u128,
+        tts_elapsed_ms: u128,
+    },
+    VoiceTurnCompleted {
+        elapsed_ms: u128,
+        output_chars: usize,
+    },
+    VoiceTurnCancelled {
+        elapsed_ms: u128,
+    },
+    VoiceTurnFailed {
+        elapsed_ms: u128,
+    },
+}
+
 pub trait SpeechToText: Send + Sync {
     fn stream_audio(
         &self,
@@ -117,6 +149,7 @@ pub enum VoiceTurnError {
 pub struct VoiceTurnOptions {
     pub cancellation_token: CancellationToken,
     pub tts_events: Option<UnboundedSender<TtsEvent>>,
+    pub voice_events: Option<UnboundedSender<VoiceEvent>>,
 }
 
 impl VoiceTurnOptions {
@@ -124,11 +157,17 @@ impl VoiceTurnOptions {
         Self {
             cancellation_token,
             tts_events: None,
+            voice_events: None,
         }
     }
 
     pub fn with_tts_events(mut self, events: UnboundedSender<TtsEvent>) -> Self {
         self.tts_events = Some(events);
+        self
+    }
+
+    pub fn with_voice_events(mut self, events: UnboundedSender<VoiceEvent>) -> Self {
+        self.voice_events = Some(events);
         self
     }
 }
@@ -182,20 +221,63 @@ where
         audio: BoxStream<'static, AudioChunk>,
         options: VoiceTurnOptions,
     ) -> std::result::Result<VoiceTurnOutput, VoiceTurnError> {
+        let started_at = Instant::now();
         let cancellation_token = options.cancellation_token.clone();
+        let voice_events = options.voice_events.clone();
         let mut transcripts = self.stt.stream_audio(audio);
 
         let transcript = loop {
             tokio::select! {
-                _ = cancellation_token.cancelled() => return Err(VoiceTurnError::Cancelled),
+                _ = cancellation_token.cancelled() => {
+                    emit_voice_event(
+                        &voice_events,
+                        VoiceEvent::VoiceTurnCancelled {
+                            elapsed_ms: started_at.elapsed().as_millis(),
+                        },
+                    );
+                    return Err(VoiceTurnError::Cancelled);
+                }
                 event = transcripts.next() => {
                     match event {
-                        Some(Ok(TranscriptEvent::Partial { .. })) => {}
-                        Some(Ok(TranscriptEvent::Final { text, .. })) => break text,
+                        Some(Ok(TranscriptEvent::Partial { text, elapsed_ms })) => {
+                            emit_voice_event(
+                                &voice_events,
+                                VoiceEvent::SttPartial {
+                                    elapsed_ms: started_at.elapsed().as_millis(),
+                                    stt_elapsed_ms: elapsed_ms,
+                                    transcript_chars: text.len(),
+                                },
+                            );
+                        }
+                        Some(Ok(TranscriptEvent::Final { text, elapsed_ms })) => {
+                            emit_voice_event(
+                                &voice_events,
+                                VoiceEvent::SttFinal {
+                                    elapsed_ms: started_at.elapsed().as_millis(),
+                                    stt_elapsed_ms: elapsed_ms,
+                                    transcript_chars: text.len(),
+                                },
+                            );
+                            break text;
+                        }
                         Some(Ok(TranscriptEvent::Done)) | None => {
+                            emit_voice_event(
+                                &voice_events,
+                                VoiceEvent::VoiceTurnFailed {
+                                    elapsed_ms: started_at.elapsed().as_millis(),
+                                },
+                            );
                             return Err(VoiceTurnError::MissingFinalTranscript);
                         }
-                        Some(Err(err)) => return Err(VoiceTurnError::Stt(err)),
+                        Some(Err(err)) => {
+                            emit_voice_event(
+                                &voice_events,
+                                VoiceEvent::VoiceTurnFailed {
+                                    elapsed_ms: started_at.elapsed().as_millis(),
+                                },
+                            );
+                            return Err(VoiceTurnError::Stt(err));
+                        }
                     }
                 }
             }
@@ -203,7 +285,7 @@ where
 
         drop(transcripts);
         self.turn
-            .run_transcript_with_options(context, transcript, options)
+            .run_transcript_with_started_at(context, transcript, options, started_at)
             .await
     }
 }
@@ -235,37 +317,62 @@ where
         transcript: impl Into<String>,
         options: VoiceTurnOptions,
     ) -> std::result::Result<VoiceTurnOutput, VoiceTurnError> {
+        self.run_transcript_with_started_at(context, transcript, options, Instant::now())
+            .await
+    }
+
+    async fn run_transcript_with_started_at(
+        &self,
+        context: &mut ConversationContext,
+        transcript: impl Into<String>,
+        options: VoiceTurnOptions,
+        started_at: Instant,
+    ) -> std::result::Result<VoiceTurnOutput, VoiceTurnError> {
+        let VoiceTurnOptions {
+            cancellation_token,
+            tts_events,
+            voice_events,
+        } = options;
         let (runtime_tx, runtime_rx) = unbounded_channel();
         let (fallback_tts_tx, _fallback_tts_rx) = unbounded_channel();
-        let tts_events = options.tts_events.unwrap_or(fallback_tts_tx);
-        let runtime_token = options.cancellation_token.clone();
-        let tts_token = options.cancellation_token.clone();
+        let tts_events = tts_events.unwrap_or(fallback_tts_tx);
+        let runtime_token = cancellation_token.clone();
+        let tts_token = cancellation_token.clone();
 
         let runtime_future = self.runtime.run_turn_with_options(
             context,
             transcript,
             RunTurnOptions::new(runtime_token).with_events(runtime_tx),
         );
-        let tts_future = self.tts.run(runtime_rx, tts_token, tts_events);
+        let tts_future = self.tts.run_observed(
+            runtime_rx,
+            tts_token,
+            tts_events,
+            voice_events.clone(),
+            started_at,
+        );
         tokio::pin!(runtime_future);
         tokio::pin!(tts_future);
 
-        tokio::select! {
+        let result = tokio::select! {
             runtime_result = &mut runtime_future => {
                 if runtime_result.is_err() {
-                    options.cancellation_token.cancel();
+                    cancellation_token.cancel();
                 }
                 let tts_result = tts_future.await;
                 voice_turn_result(runtime_result, tts_result)
             }
             tts_result = &mut tts_future => {
                 if tts_result.is_err() {
-                    options.cancellation_token.cancel();
+                    cancellation_token.cancel();
                 }
                 let runtime_result = runtime_future.await;
                 voice_turn_result(runtime_result, tts_result)
             }
-        }
+        };
+
+        emit_voice_turn_result(&voice_events, &result, started_at);
+        result
     }
 }
 
@@ -284,6 +391,29 @@ fn voice_turn_result(
             _ => Err(VoiceTurnError::Cancelled),
         },
         Err(err) => Err(VoiceTurnError::Runtime(err)),
+    }
+}
+
+fn emit_voice_turn_result(
+    voice_events: &Option<UnboundedSender<VoiceEvent>>,
+    result: &std::result::Result<VoiceTurnOutput, VoiceTurnError>,
+    started_at: Instant,
+) {
+    let elapsed_ms = started_at.elapsed().as_millis();
+    let event = match result {
+        Ok(output) => VoiceEvent::VoiceTurnCompleted {
+            elapsed_ms,
+            output_chars: output.text.len(),
+        },
+        Err(VoiceTurnError::Cancelled) => VoiceEvent::VoiceTurnCancelled { elapsed_ms },
+        Err(_) => VoiceEvent::VoiceTurnFailed { elapsed_ms },
+    };
+    emit_voice_event(voice_events, event);
+}
+
+fn emit_voice_event(events: &Option<UnboundedSender<VoiceEvent>>, event: VoiceEvent) {
+    if let Some(events) = events {
+        let _ = events.send(event);
     }
 }
 
@@ -306,6 +436,24 @@ where
         cancellation_token: CancellationToken,
         tts_events: UnboundedSender<TtsEvent>,
     ) -> std::result::Result<(), TtsAdapterError> {
+        self.run_observed(
+            runtime_events,
+            cancellation_token,
+            tts_events,
+            None,
+            Instant::now(),
+        )
+        .await
+    }
+
+    async fn run_observed(
+        &self,
+        runtime_events: UnboundedReceiver<RuntimeEvent>,
+        cancellation_token: CancellationToken,
+        tts_events: UnboundedSender<TtsEvent>,
+        voice_events: Option<UnboundedSender<VoiceEvent>>,
+        started_at: Instant,
+    ) -> std::result::Result<(), TtsAdapterError> {
         let (text_tx, text_rx) = unbounded_channel();
         let mut text_tx = Some(text_tx);
         let mut runtime_events = Some(runtime_events);
@@ -321,6 +469,15 @@ where
                 _ = cancellation_token.cancelled() => return Err(TtsAdapterError::Cancelled),
                 runtime_event = recv_runtime_event(&mut runtime_events), if runtime_events.is_some() => {
                     match runtime_event {
+                        Some(RuntimeEvent::LlmFirstToken { elapsed_ms }) => {
+                            emit_voice_event(
+                                &voice_events,
+                                VoiceEvent::LlmFirstToken {
+                                    elapsed_ms: started_at.elapsed().as_millis(),
+                                    runtime_elapsed_ms: elapsed_ms,
+                                },
+                            );
+                        }
                         Some(RuntimeEvent::AssistantToken { text, .. }) => {
                             if let Some(sender) = &text_tx {
                                 let _ = sender.send(text);
@@ -343,7 +500,18 @@ where
                     match audio_event {
                         Some(Ok(event)) => {
                             audio_done = matches!(event, TtsEvent::Done);
+                            if let TtsEvent::FirstAudio { elapsed_ms } = event {
+                                emit_voice_event(
+                                    &voice_events,
+                                    VoiceEvent::TtsFirstAudio {
+                                        elapsed_ms: started_at.elapsed().as_millis(),
+                                        tts_elapsed_ms: elapsed_ms,
+                                    },
+                                );
+                                let _ = tts_events.send(TtsEvent::FirstAudio { elapsed_ms });
+                            } else {
                             let _ = tts_events.send(event);
+                            }
                         }
                         Some(Err(err)) => return Err(TtsAdapterError::from(err)),
                         None => audio_done = true,
@@ -688,6 +856,7 @@ mod tests {
         );
         let mut context = ConversationContext::new();
         let (tts_tx, mut tts_rx) = mpsc::unbounded_channel();
+        let (voice_tx, mut voice_rx) = mpsc::unbounded_channel();
         let audio = Box::pin(futures_util::stream::iter(vec![
             AudioChunk::new("hello").with_elapsed_ms(3),
             AudioChunk::new(" runtime").with_elapsed_ms(9),
@@ -697,7 +866,9 @@ mod tests {
             .run_audio_turn_with_options(
                 &mut context,
                 audio,
-                VoiceTurnOptions::default().with_tts_events(tts_tx),
+                VoiceTurnOptions::default()
+                    .with_tts_events(tts_tx)
+                    .with_voice_events(voice_tx),
             )
             .await
             .expect("voice pipeline should succeed");
@@ -719,6 +890,41 @@ mod tests {
             vec![b"fake-tts:0:Hi".to_vec(), b"fake-tts:1: there".to_vec()]
         );
         assert!(matches!(events.last(), Some(TtsEvent::Done)));
+
+        let voice_events = drain_voice_events(&mut voice_rx);
+        assert!(voice_events.iter().any(|event| matches!(
+            event,
+            VoiceEvent::SttPartial {
+                transcript_chars: 5,
+                stt_elapsed_ms: 3,
+                ..
+            }
+        )));
+        assert!(voice_events.iter().any(|event| matches!(
+            event,
+            VoiceEvent::SttFinal {
+                transcript_chars: 13,
+                stt_elapsed_ms: 9,
+                ..
+            }
+        )));
+        assert!(
+            voice_events
+                .iter()
+                .any(|event| matches!(event, VoiceEvent::LlmFirstToken { .. }))
+        );
+        assert!(
+            voice_events
+                .iter()
+                .any(|event| matches!(event, VoiceEvent::TtsFirstAudio { .. }))
+        );
+        assert!(matches!(
+            voice_events.last(),
+            Some(VoiceEvent::VoiceTurnCompleted {
+                output_chars: 8,
+                ..
+            })
+        ));
     }
 
     #[tokio::test]
@@ -736,13 +942,14 @@ mod tests {
         let cancellation_token = CancellationToken::new();
         let mut context = ConversationContext::new();
         let (_audio_tx, audio_rx) = mpsc::unbounded_channel();
+        let (voice_tx, mut voice_rx) = mpsc::unbounded_channel();
         let audio = receiver_stream(audio_rx);
 
         let result = {
             let turn = pipeline.run_audio_turn_with_options(
                 &mut context,
                 audio,
-                VoiceTurnOptions::new(cancellation_token.clone()),
+                VoiceTurnOptions::new(cancellation_token.clone()).with_voice_events(voice_tx),
             );
             tokio::pin!(turn);
 
@@ -761,6 +968,10 @@ mod tests {
         assert!(matches!(result, Err(VoiceTurnError::Cancelled)));
         assert!(context.messages().is_empty());
         assert_eq!(stt_probe.active_stream_count(), 0);
+        assert!(matches!(
+            drain_voice_events(&mut voice_rx).last(),
+            Some(VoiceEvent::VoiceTurnCancelled { .. })
+        ));
     }
 
     #[tokio::test]
@@ -973,6 +1184,14 @@ mod tests {
     }
 
     fn drain_tts_events(rx: &mut UnboundedReceiver<TtsEvent>) -> Vec<TtsEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
+    fn drain_voice_events(rx: &mut UnboundedReceiver<VoiceEvent>) -> Vec<VoiceEvent> {
         let mut events = Vec::new();
         while let Ok(event) = rx.try_recv() {
             events.push(event);
