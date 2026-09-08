@@ -17,4 +17,5 @@ pub use tools::{
 };
 pub use voice::{
     FakeTextToSpeech, RuntimeTtsAdapter, TextToSpeech, TtsAdapterError, TtsError, TtsEvent,
+    VoiceTurnError, VoiceTurnOptions, VoiceTurnOutput, VoiceTurnRunner,
 };

@@ -16,7 +16,14 @@ use thiserror::Error;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
-use crate::runtime::events::{RequestState, RuntimeEvent};
+use crate::{
+    llm::LlmProvider,
+    runtime::{
+        AgentRuntime, ConversationContext, RunTurnOptions, RuntimeConfig, RuntimeError,
+        events::{RequestState, RuntimeEvent},
+    },
+    tools::ToolRegistry,
+};
 
 pub type Result<T> = std::result::Result<T, TtsError>;
 
@@ -45,6 +52,133 @@ pub enum TtsAdapterError {
 
     #[error("TTS adapter was cancelled")]
     Cancelled,
+}
+
+#[derive(Debug, Error)]
+pub enum VoiceTurnError {
+    #[error(transparent)]
+    Runtime(#[from] RuntimeError),
+
+    #[error(transparent)]
+    Tts(#[from] TtsError),
+
+    #[error("voice turn was cancelled")]
+    Cancelled,
+}
+
+#[derive(Debug, Clone)]
+pub struct VoiceTurnOptions {
+    pub cancellation_token: CancellationToken,
+    pub tts_events: Option<UnboundedSender<TtsEvent>>,
+}
+
+impl VoiceTurnOptions {
+    pub fn new(cancellation_token: CancellationToken) -> Self {
+        Self {
+            cancellation_token,
+            tts_events: None,
+        }
+    }
+
+    pub fn with_tts_events(mut self, events: UnboundedSender<TtsEvent>) -> Self {
+        self.tts_events = Some(events);
+        self
+    }
+}
+
+impl Default for VoiceTurnOptions {
+    fn default() -> Self {
+        Self::new(CancellationToken::new())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VoiceTurnOutput {
+    pub text: String,
+}
+
+pub struct VoiceTurnRunner<P, T> {
+    runtime: AgentRuntime<P>,
+    tts: RuntimeTtsAdapter<T>,
+}
+
+impl<P, T> VoiceTurnRunner<P, T>
+where
+    P: LlmProvider,
+    T: TextToSpeech,
+{
+    pub fn new(provider: P, tools: ToolRegistry, config: RuntimeConfig, tts: T) -> Self {
+        Self {
+            runtime: AgentRuntime::new(provider, tools, config),
+            tts: RuntimeTtsAdapter::new(tts),
+        }
+    }
+
+    pub async fn run_transcript(
+        &self,
+        context: &mut ConversationContext,
+        transcript: impl Into<String>,
+    ) -> std::result::Result<VoiceTurnOutput, VoiceTurnError> {
+        self.run_transcript_with_options(context, transcript, VoiceTurnOptions::default())
+            .await
+    }
+
+    pub async fn run_transcript_with_options(
+        &self,
+        context: &mut ConversationContext,
+        transcript: impl Into<String>,
+        options: VoiceTurnOptions,
+    ) -> std::result::Result<VoiceTurnOutput, VoiceTurnError> {
+        let (runtime_tx, runtime_rx) = unbounded_channel();
+        let (fallback_tts_tx, _fallback_tts_rx) = unbounded_channel();
+        let tts_events = options.tts_events.unwrap_or(fallback_tts_tx);
+        let runtime_token = options.cancellation_token.clone();
+        let tts_token = options.cancellation_token.clone();
+
+        let runtime_future = self.runtime.run_turn_with_options(
+            context,
+            transcript,
+            RunTurnOptions::new(runtime_token).with_events(runtime_tx),
+        );
+        let tts_future = self.tts.run(runtime_rx, tts_token, tts_events);
+        tokio::pin!(runtime_future);
+        tokio::pin!(tts_future);
+
+        tokio::select! {
+            runtime_result = &mut runtime_future => {
+                if runtime_result.is_err() {
+                    options.cancellation_token.cancel();
+                }
+                let tts_result = tts_future.await;
+                voice_turn_result(runtime_result, tts_result)
+            }
+            tts_result = &mut tts_future => {
+                if tts_result.is_err() {
+                    options.cancellation_token.cancel();
+                }
+                let runtime_result = runtime_future.await;
+                voice_turn_result(runtime_result, tts_result)
+            }
+        }
+    }
+}
+
+fn voice_turn_result(
+    runtime_result: crate::runtime::Result<String>,
+    tts_result: std::result::Result<(), TtsAdapterError>,
+) -> std::result::Result<VoiceTurnOutput, VoiceTurnError> {
+    match runtime_result {
+        Ok(text) => match tts_result {
+            Ok(()) => Ok(VoiceTurnOutput { text }),
+            Err(TtsAdapterError::Cancelled) => Err(VoiceTurnError::Cancelled),
+            Err(TtsAdapterError::Tts(err)) => Err(VoiceTurnError::Tts(err)),
+        },
+        Err(RuntimeError::Cancelled) => match tts_result {
+            Err(TtsAdapterError::Tts(err)) => Err(VoiceTurnError::Tts(err)),
+            _ => Err(VoiceTurnError::Cancelled),
+        },
+        Err(err) => Err(VoiceTurnError::Runtime(err)),
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -303,6 +437,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn voice_turn_runner_streams_audio_and_commits_completed_answer() {
+        let provider = StaticTokenProvider::new(vec!["Hel", "lo"]);
+        let tts = FakeTextToSpeech::new();
+        let tts_probe = tts.clone();
+        let runner = VoiceTurnRunner::new(
+            provider,
+            ToolRegistry::new(),
+            RuntimeConfig::new("test"),
+            tts,
+        );
+        let mut context = ConversationContext::new();
+        let (audio_tx, mut audio_rx) = mpsc::unbounded_channel();
+
+        let output = runner
+            .run_transcript_with_options(
+                &mut context,
+                "hello",
+                VoiceTurnOptions::default().with_tts_events(audio_tx),
+            )
+            .await
+            .expect("voice turn should succeed");
+
+        assert_eq!(output.text, "Hello");
+        assert_eq!(
+            context
+                .messages()
+                .last()
+                .map(|message| message.content.as_str()),
+            Some("Hello")
+        );
+
+        let events = drain_tts_events(&mut audio_rx);
+        assert!(matches!(events.first(), Some(TtsEvent::FirstAudio { .. })));
+        assert_eq!(
+            audio_chunks(&events),
+            vec![b"fake-tts:0:Hel".to_vec(), b"fake-tts:1:lo".to_vec()]
+        );
+        assert!(matches!(events.last(), Some(TtsEvent::Done)));
+        assert_eq!(tts_probe.active_stream_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_turn_runner_cancellation_drops_tts_and_leaves_partial_text_uncommitted() {
+        let provider = TokenThenHangingProvider {
+            token: "partial".to_string(),
+        };
+        let tts = FakeTextToSpeech::new();
+        let tts_probe = tts.clone();
+        let runner = VoiceTurnRunner::new(
+            provider,
+            ToolRegistry::new(),
+            RuntimeConfig::new("test"),
+            tts,
+        );
+        let cancellation_token = CancellationToken::new();
+        let mut context = ConversationContext::new();
+        let (audio_tx, mut audio_rx) = mpsc::unbounded_channel();
+
+        let result = {
+            let turn = runner.run_transcript_with_options(
+                &mut context,
+                "hello",
+                VoiceTurnOptions::new(cancellation_token.clone()).with_tts_events(audio_tx),
+            );
+            tokio::pin!(turn);
+
+            let first_chunk = tokio::select! {
+                chunk = next_audio_chunk(&mut audio_rx) => chunk,
+                result = &mut turn => panic!("voice turn finished before cancellation: {result:?}"),
+            };
+            assert_eq!(first_chunk, b"fake-tts:0:partial".to_vec());
+
+            cancellation_token.cancel();
+
+            timeout(Duration::from_secs(1), &mut turn)
+                .await
+                .expect("voice turn should stop after cancellation")
+        };
+
+        assert!(matches!(result, Err(VoiceTurnError::Cancelled)));
+        assert!(
+            context
+                .messages()
+                .iter()
+                .all(|message| message.role != "assistant"),
+            "partial assistant output should not be committed: {:#?}",
+            context.messages()
+        );
+        assert_eq!(tts_probe.active_stream_count(), 0);
+    }
+
+    #[tokio::test]
     async fn cancelling_during_tts_streaming_drops_active_tts_stream() {
         let tts = HangingTextToSpeech::new();
         let active_streams = tts.active_streams();
@@ -419,6 +645,14 @@ mod tests {
         chunks
     }
 
+    fn drain_tts_events(rx: &mut UnboundedReceiver<TtsEvent>) -> Vec<TtsEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
+
     async fn wait_for_count(count: &AtomicUsize, expected: usize) {
         timeout(Duration::from_secs(1), async {
             while count.load(Ordering::SeqCst) != expected {
@@ -491,6 +725,59 @@ mod tests {
     impl Drop for HangingTtsStream {
         fn drop(&mut self) {
             self.active_streams.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct StaticTokenProvider {
+        tokens: Vec<String>,
+    }
+
+    impl StaticTokenProvider {
+        fn new(tokens: Vec<&str>) -> Self {
+            Self {
+                tokens: tokens.into_iter().map(str::to_string).collect(),
+            }
+        }
+    }
+
+    impl LlmProvider for StaticTokenProvider {
+        fn stream_chat(&self, _req: ChatRequest) -> BoxStream<'static, LlmResult<TokenEvent>> {
+            let mut events = self
+                .tokens
+                .iter()
+                .cloned()
+                .map(|text| Ok(TokenEvent::Token { text }))
+                .collect::<Vec<_>>();
+            events.push(Ok(TokenEvent::Done));
+            Box::pin(futures_util::stream::iter(events))
+        }
+    }
+
+    struct TokenThenHangingProvider {
+        token: String,
+    }
+
+    impl LlmProvider for TokenThenHangingProvider {
+        fn stream_chat(&self, _req: ChatRequest) -> BoxStream<'static, LlmResult<TokenEvent>> {
+            Box::pin(TokenThenHangingStream {
+                token: Some(self.token.clone()),
+            })
+        }
+    }
+
+    struct TokenThenHangingStream {
+        token: Option<String>,
+    }
+
+    impl Stream for TokenThenHangingStream {
+        type Item = LlmResult<TokenEvent>;
+
+        fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            if let Some(text) = self.token.take() {
+                return Poll::Ready(Some(Ok(TokenEvent::Token { text })));
+            }
+
+            Poll::Pending
         }
     }
 
