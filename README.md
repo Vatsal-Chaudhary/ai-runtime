@@ -34,3 +34,5 @@ The CLI prints structured runtime events for lifecycle state, LLM first-token la
 `voice-fake` treats typed text as fake audio chunks, runs it through `FakeSpeechToText`, a deterministic fake LLM provider, and `FakeTextToSpeech`, then prints voice latency events plus fake TTS audio chunks.
 
 The voice library also exposes `VoiceSession`, which owns conversation state for a running voice interaction. Starting a new audio turn while another turn is active cancels the in-flight LLM/TTS work, emits `VoiceTurnInterrupted`, and prevents partial assistant output from being committed.
+
+`VoiceTransport` is the boundary for real-time audio transport. The included `FakeVoiceTransport` can inject user audio turns, capture outgoing TTS events, and exercise disconnect behavior without LiveKit or provider credentials.

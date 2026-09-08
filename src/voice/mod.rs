@@ -10,7 +10,7 @@ use std::{
 };
 
 use futures_core::{Stream, stream::BoxStream};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, future::BoxFuture};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::{
@@ -152,12 +152,29 @@ pub enum VoiceTurnError {
 }
 
 #[derive(Debug, Error)]
+pub enum VoiceTransportError {
+    #[error("voice transport is closed")]
+    Closed,
+}
+
+#[derive(Debug, Error)]
 pub enum VoiceSessionError {
     #[error(transparent)]
     VoiceTurn(#[from] VoiceTurnError),
 
     #[error("voice turn task failed: {0}")]
     TaskJoin(#[from] tokio::task::JoinError),
+}
+
+pub enum VoiceTransportEvent {
+    AudioTurn(BoxStream<'static, AudioChunk>),
+    Closed,
+}
+
+pub trait VoiceTransport: Send {
+    fn next_event(&mut self) -> BoxFuture<'_, Option<VoiceTransportEvent>>;
+
+    fn tts_events(&self) -> UnboundedSender<TtsEvent>;
 }
 
 #[derive(Debug, Clone)]
@@ -298,6 +315,47 @@ where
 
         let output = active_turn.task.await??;
         Ok(Some(output))
+    }
+
+    pub async fn cancel_active_turn(&mut self) -> std::result::Result<(), VoiceSessionError> {
+        let Some(active_turn) = self.active_turn.take() else {
+            return Ok(());
+        };
+
+        let was_running = !active_turn.task.is_finished();
+        if was_running {
+            active_turn.cancellation_token.cancel();
+        }
+
+        match active_turn.task.await? {
+            Ok(_) => Ok(()),
+            Err(VoiceTurnError::Cancelled) if was_running => Ok(()),
+            Err(err) => Err(VoiceSessionError::VoiceTurn(err)),
+        }
+    }
+
+    pub async fn run_transport<V>(
+        &mut self,
+        mut transport: V,
+    ) -> std::result::Result<(), VoiceSessionError>
+    where
+        V: VoiceTransport,
+    {
+        loop {
+            match transport.next_event().await {
+                Some(VoiceTransportEvent::AudioTurn(audio)) => {
+                    self.start_audio_turn(audio, transport.tts_events()).await?;
+                }
+                Some(VoiceTransportEvent::Closed) => {
+                    let _ = self.finish_active_turn().await?;
+                    return Ok(());
+                }
+                None => {
+                    self.cancel_active_turn().await?;
+                    return Ok(());
+                }
+            }
+        }
     }
 
     async fn interrupt_active_turn(&mut self) -> std::result::Result<(), VoiceSessionError> {
@@ -674,6 +732,86 @@ fn receiver_stream<T: Send + 'static>(rx: UnboundedReceiver<T>) -> BoxStream<'st
     Box::pin(futures_util::stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|item| (item, rx))
     }))
+}
+
+pub struct FakeVoiceTransport {
+    input_rx: UnboundedReceiver<VoiceTransportEvent>,
+    tts_tx: UnboundedSender<TtsEvent>,
+}
+
+pub struct FakeVoiceTransportHandle {
+    input_tx: Option<UnboundedSender<VoiceTransportEvent>>,
+    tts_rx: UnboundedReceiver<TtsEvent>,
+}
+
+impl FakeVoiceTransport {
+    pub fn new() -> (Self, FakeVoiceTransportHandle) {
+        let (input_tx, input_rx) = unbounded_channel();
+        let (tts_tx, tts_rx) = unbounded_channel();
+
+        (
+            Self { input_rx, tts_tx },
+            FakeVoiceTransportHandle {
+                input_tx: Some(input_tx),
+                tts_rx,
+            },
+        )
+    }
+}
+
+impl VoiceTransport for FakeVoiceTransport {
+    fn next_event(&mut self) -> BoxFuture<'_, Option<VoiceTransportEvent>> {
+        Box::pin(async move { self.input_rx.recv().await })
+    }
+
+    fn tts_events(&self) -> UnboundedSender<TtsEvent> {
+        self.tts_tx.clone()
+    }
+}
+
+impl FakeVoiceTransportHandle {
+    pub fn send_audio_turn(
+        &self,
+        chunks: Vec<AudioChunk>,
+    ) -> std::result::Result<(), VoiceTransportError> {
+        self.send_audio_stream(Box::pin(futures_util::stream::iter(chunks)))
+    }
+
+    pub fn send_audio_stream(
+        &self,
+        audio: BoxStream<'static, AudioChunk>,
+    ) -> std::result::Result<(), VoiceTransportError> {
+        self.input_tx
+            .as_ref()
+            .ok_or(VoiceTransportError::Closed)?
+            .send(VoiceTransportEvent::AudioTurn(audio))
+            .map_err(|_| VoiceTransportError::Closed)
+    }
+
+    pub fn close(&mut self) -> std::result::Result<(), VoiceTransportError> {
+        let Some(input_tx) = self.input_tx.take() else {
+            return Err(VoiceTransportError::Closed);
+        };
+        input_tx
+            .send(VoiceTransportEvent::Closed)
+            .map_err(|_| VoiceTransportError::Closed)
+    }
+
+    pub fn disconnect(&mut self) {
+        self.input_tx = None;
+    }
+
+    pub async fn recv_tts_event(&mut self) -> Option<TtsEvent> {
+        self.tts_rx.recv().await
+    }
+
+    pub fn drain_tts_events(&mut self) -> Vec<TtsEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.tts_rx.try_recv() {
+            events.push(event);
+        }
+        events
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1212,6 +1350,170 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn voice_session_runs_normal_turn_from_fake_transport() {
+        let provider = StaticTokenProvider::new(vec!["transport ", "ok"]);
+        let mut session = VoiceSession::new(
+            provider,
+            ToolRegistry::new(),
+            RuntimeConfig::new("test"),
+            FakeSpeechToText::new(),
+            FakeTextToSpeech::new(),
+            ConversationContext::new(),
+        );
+        let (transport, mut handle) = FakeVoiceTransport::new();
+
+        let result = {
+            let run = session.run_transport(transport);
+            tokio::pin!(run);
+
+            handle
+                .send_audio_turn(vec![AudioChunk::new("transport input").with_elapsed_ms(12)])
+                .expect("transport input should send");
+            handle.close().expect("transport should close gracefully");
+
+            timeout(Duration::from_secs(1), &mut run)
+                .await
+                .expect("transport runner should finish")
+        };
+
+        result.expect("transport runner should succeed");
+        assert_eq!(
+            audio_chunks(&handle.drain_tts_events()),
+            vec![b"fake-tts:0:transport ".to_vec(), b"fake-tts:1:ok".to_vec()]
+        );
+
+        let context = session.context_snapshot().await;
+        assert_eq!(
+            context
+                .messages()
+                .last()
+                .map(|message| (message.role.as_str(), message.content.as_str())),
+            Some(("assistant", "transport ok"))
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_transport_barge_in_cancels_playback_and_runs_next_turn() {
+        let provider = InterruptibleProvider::new();
+        let tts = FakeTextToSpeech::new();
+        let tts_probe = tts.clone();
+        let (voice_tx, mut voice_rx) = mpsc::unbounded_channel();
+        let mut session = VoiceSession::new(
+            provider,
+            ToolRegistry::new(),
+            RuntimeConfig::new("test"),
+            FakeSpeechToText::new(),
+            tts,
+            ConversationContext::new(),
+        )
+        .with_voice_events(voice_tx);
+        let (transport, mut handle) = FakeVoiceTransport::new();
+
+        let result = {
+            let run = session.run_transport(transport);
+            tokio::pin!(run);
+
+            handle
+                .send_audio_turn(vec![AudioChunk::new("first request").with_elapsed_ms(1)])
+                .expect("first input should send");
+            let first_chunk = tokio::select! {
+                chunk = next_transport_audio_chunk(&mut handle) => chunk,
+                result = &mut run => panic!("transport runner finished before first playback: {result:?}"),
+            };
+            assert_eq!(first_chunk, b"fake-tts:0:first partial".to_vec());
+
+            handle
+                .send_audio_turn(vec![AudioChunk::new("second request").with_elapsed_ms(2)])
+                .expect("second input should send");
+            handle.close().expect("transport should close gracefully");
+
+            timeout(Duration::from_secs(1), &mut run)
+                .await
+                .expect("transport runner should finish")
+        };
+
+        result.expect("transport runner should succeed");
+        assert_eq!(tts_probe.active_stream_count(), 0);
+
+        let context = session.context_snapshot().await;
+        assert!(
+            context
+                .messages()
+                .iter()
+                .all(|message| message.content != "first partial"),
+            "interrupted assistant text should not be committed: {:#?}",
+            context.messages()
+        );
+        assert_eq!(
+            context
+                .messages()
+                .last()
+                .map(|message| (message.role.as_str(), message.content.as_str())),
+            Some(("assistant", "second complete"))
+        );
+
+        let voice_events = drain_voice_events(&mut voice_rx);
+        assert!(
+            voice_events
+                .iter()
+                .any(|event| matches!(event, VoiceEvent::VoiceTurnInterrupted { .. })),
+            "transport barge-in should emit interruption: {voice_events:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropped_fake_transport_cancels_active_turn_cleanly() {
+        let provider = TokenThenHangingProvider {
+            token: "partial".to_string(),
+        };
+        let tts = FakeTextToSpeech::new();
+        let tts_probe = tts.clone();
+        let mut session = VoiceSession::new(
+            provider,
+            ToolRegistry::new(),
+            RuntimeConfig::new("test"),
+            FakeSpeechToText::new(),
+            tts,
+            ConversationContext::new(),
+        );
+        let (transport, mut handle) = FakeVoiceTransport::new();
+
+        let result = {
+            let run = session.run_transport(transport);
+            tokio::pin!(run);
+
+            handle
+                .send_audio_turn(vec![AudioChunk::new("dropped input").with_elapsed_ms(1)])
+                .expect("input should send");
+            let first_chunk = tokio::select! {
+                chunk = next_transport_audio_chunk(&mut handle) => chunk,
+                result = &mut run => panic!("transport runner finished before active turn: {result:?}"),
+            };
+            assert_eq!(first_chunk, b"fake-tts:0:partial".to_vec());
+
+            handle.disconnect();
+
+            timeout(Duration::from_secs(1), &mut run)
+                .await
+                .expect("transport runner should stop after disconnect")
+        };
+
+        result.expect("disconnect should not surface as an error");
+        assert!(!session.has_active_turn());
+        assert_eq!(tts_probe.active_stream_count(), 0);
+
+        let context = session.context_snapshot().await;
+        assert!(
+            context
+                .messages()
+                .iter()
+                .all(|message| message.role != "assistant"),
+            "partial assistant output should not be committed: {:#?}",
+            context.messages()
+        );
+    }
+
+    #[tokio::test]
     async fn voice_turn_runner_streams_audio_and_commits_completed_answer() {
         let provider = StaticTokenProvider::new(vec!["Hel", "lo"]);
         let tts = FakeTextToSpeech::new();
@@ -1402,6 +1704,20 @@ mod tests {
                 .await
                 .expect("audio event should arrive")
                 .expect("audio event stream should still be open")
+            {
+                TtsEvent::AudioChunk { bytes, .. } => return bytes,
+                TtsEvent::FirstAudio { .. } => {}
+                TtsEvent::Done => panic!("TTS stream completed before audio chunk"),
+            }
+        }
+    }
+
+    async fn next_transport_audio_chunk(handle: &mut FakeVoiceTransportHandle) -> Vec<u8> {
+        loop {
+            match timeout(Duration::from_secs(1), handle.recv_tts_event())
+                .await
+                .expect("transport audio event should arrive")
+                .expect("transport audio stream should still be open")
             {
                 TtsEvent::AudioChunk { bytes, .. } => return bytes,
                 TtsEvent::FirstAudio { .. } => {}
