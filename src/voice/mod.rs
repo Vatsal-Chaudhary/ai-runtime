@@ -13,7 +13,10 @@ use futures_core::{Stream, stream::BoxStream};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
+use tokio::{
+    sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -101,6 +104,9 @@ pub enum VoiceEvent {
     VoiceTurnCancelled {
         elapsed_ms: u128,
     },
+    VoiceTurnInterrupted {
+        elapsed_ms: u128,
+    },
     VoiceTurnFailed {
         elapsed_ms: u128,
     },
@@ -145,6 +151,15 @@ pub enum VoiceTurnError {
     MissingFinalTranscript,
 }
 
+#[derive(Debug, Error)]
+pub enum VoiceSessionError {
+    #[error(transparent)]
+    VoiceTurn(#[from] VoiceTurnError),
+
+    #[error("voice turn task failed: {0}")]
+    TaskJoin(#[from] tokio::task::JoinError),
+}
+
 #[derive(Debug, Clone)]
 pub struct VoiceTurnOptions {
     pub cancellation_token: CancellationToken,
@@ -170,6 +185,11 @@ impl VoiceTurnOptions {
         self.voice_events = Some(events);
         self
     }
+
+    fn with_optional_voice_events(mut self, events: Option<UnboundedSender<VoiceEvent>>) -> Self {
+        self.voice_events = events;
+        self
+    }
 }
 
 impl Default for VoiceTurnOptions {
@@ -191,6 +211,125 @@ pub struct VoiceTurnRunner<P, T> {
 pub struct VoicePipelineRunner<P, S, T> {
     stt: S,
     turn: VoiceTurnRunner<P, T>,
+}
+
+pub struct VoiceSession<P, S, T> {
+    pipeline: Arc<VoicePipelineRunner<P, S, T>>,
+    context: Arc<tokio::sync::Mutex<ConversationContext>>,
+    voice_events: Option<UnboundedSender<VoiceEvent>>,
+    active_turn: Option<ActiveVoiceTurn>,
+}
+
+struct ActiveVoiceTurn {
+    cancellation_token: CancellationToken,
+    started_at: Instant,
+    task: JoinHandle<std::result::Result<VoiceTurnOutput, VoiceTurnError>>,
+}
+
+impl<P, S, T> VoiceSession<P, S, T>
+where
+    P: LlmProvider + 'static,
+    S: SpeechToText + 'static,
+    T: TextToSpeech + 'static,
+{
+    pub fn new(
+        provider: P,
+        tools: ToolRegistry,
+        config: RuntimeConfig,
+        stt: S,
+        tts: T,
+        context: ConversationContext,
+    ) -> Self {
+        Self {
+            pipeline: Arc::new(VoicePipelineRunner::new(provider, tools, config, stt, tts)),
+            context: Arc::new(tokio::sync::Mutex::new(context)),
+            voice_events: None,
+            active_turn: None,
+        }
+    }
+
+    pub fn with_voice_events(mut self, events: UnboundedSender<VoiceEvent>) -> Self {
+        self.voice_events = Some(events);
+        self
+    }
+
+    pub fn has_active_turn(&self) -> bool {
+        self.active_turn.is_some()
+    }
+
+    pub async fn context_snapshot(&self) -> ConversationContext {
+        self.context.lock().await.clone()
+    }
+
+    pub async fn start_audio_turn(
+        &mut self,
+        audio: BoxStream<'static, AudioChunk>,
+        tts_events: UnboundedSender<TtsEvent>,
+    ) -> std::result::Result<(), VoiceSessionError> {
+        self.interrupt_active_turn().await?;
+
+        let pipeline = Arc::clone(&self.pipeline);
+        let context = Arc::clone(&self.context);
+        let cancellation_token = CancellationToken::new();
+        let options = VoiceTurnOptions::new(cancellation_token.clone())
+            .with_tts_events(tts_events)
+            .with_optional_voice_events(self.voice_events.clone());
+        let task = tokio::spawn(async move {
+            let mut context = context.lock().await;
+            pipeline
+                .run_audio_turn_with_options(&mut context, audio, options)
+                .await
+        });
+
+        self.active_turn = Some(ActiveVoiceTurn {
+            cancellation_token,
+            started_at: Instant::now(),
+            task,
+        });
+        Ok(())
+    }
+
+    pub async fn finish_active_turn(
+        &mut self,
+    ) -> std::result::Result<Option<VoiceTurnOutput>, VoiceSessionError> {
+        let Some(active_turn) = self.active_turn.take() else {
+            return Ok(None);
+        };
+
+        let output = active_turn.task.await??;
+        Ok(Some(output))
+    }
+
+    async fn interrupt_active_turn(&mut self) -> std::result::Result<(), VoiceSessionError> {
+        let Some(active_turn) = self.active_turn.take() else {
+            return Ok(());
+        };
+
+        let was_running = !active_turn.task.is_finished();
+        if was_running {
+            emit_voice_event(
+                &self.voice_events,
+                VoiceEvent::VoiceTurnInterrupted {
+                    elapsed_ms: active_turn.started_at.elapsed().as_millis(),
+                },
+            );
+            active_turn.cancellation_token.cancel();
+        }
+
+        match active_turn.task.await? {
+            Ok(_) => Ok(()),
+            Err(VoiceTurnError::Cancelled) if was_running => Ok(()),
+            Err(err) => Err(VoiceSessionError::VoiceTurn(err)),
+        }
+    }
+}
+
+impl<P, S, T> Drop for VoiceSession<P, S, T> {
+    fn drop(&mut self) {
+        if let Some(active_turn) = &self.active_turn {
+            active_turn.cancellation_token.cancel();
+        }
+    }
 }
 
 impl<P, S, T> VoicePipelineRunner<P, S, T>
@@ -975,6 +1114,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn voice_session_barge_in_cancels_active_turn_and_completes_next_turn() {
+        let provider = InterruptibleProvider::new();
+        let stt = FakeSpeechToText::new();
+        let tts = FakeTextToSpeech::new();
+        let tts_probe = tts.clone();
+        let (voice_tx, mut voice_rx) = mpsc::unbounded_channel();
+        let mut session = VoiceSession::new(
+            provider,
+            ToolRegistry::new(),
+            RuntimeConfig::new("test"),
+            stt,
+            tts,
+            ConversationContext::new(),
+        )
+        .with_voice_events(voice_tx);
+        let (first_tts_tx, mut first_tts_rx) = mpsc::unbounded_channel();
+
+        session
+            .start_audio_turn(audio_stream_from_text("first request"), first_tts_tx)
+            .await
+            .expect("first turn should start");
+        assert!(session.has_active_turn());
+
+        let first_chunk = next_audio_chunk(&mut first_tts_rx).await;
+        assert_eq!(first_chunk, b"fake-tts:0:first partial".to_vec());
+
+        let (second_tts_tx, mut second_tts_rx) = mpsc::unbounded_channel();
+        session
+            .start_audio_turn(audio_stream_from_text("second request"), second_tts_tx)
+            .await
+            .expect("second turn should interrupt first and start");
+
+        let output = timeout(Duration::from_secs(1), session.finish_active_turn())
+            .await
+            .expect("second turn should finish")
+            .expect("second turn should succeed")
+            .expect("second turn should be active");
+
+        assert_eq!(output.text, "second complete");
+        assert_eq!(
+            drain_audio_chunks(&mut second_tts_rx),
+            vec![
+                b"fake-tts:0:second ".to_vec(),
+                b"fake-tts:1:complete".to_vec()
+            ]
+        );
+        assert!(!session.has_active_turn());
+        assert_eq!(tts_probe.active_stream_count(), 0);
+
+        let context = session.context_snapshot().await;
+        assert!(
+            context
+                .messages()
+                .iter()
+                .all(|message| message.content != "first partial"),
+            "interrupted assistant text should not be committed: {:#?}",
+            context.messages()
+        );
+        assert_eq!(
+            context
+                .messages()
+                .iter()
+                .filter(|message| message.role == "user")
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first request", "second request"]
+        );
+        assert_eq!(
+            context
+                .messages()
+                .last()
+                .map(|message| (message.role.as_str(), message.content.as_str())),
+            Some(("assistant", "second complete"))
+        );
+
+        let voice_events = drain_voice_events(&mut voice_rx);
+        assert!(
+            voice_events
+                .iter()
+                .any(|event| matches!(event, VoiceEvent::VoiceTurnInterrupted { .. })),
+            "barge-in should emit an interruption event: {voice_events:#?}"
+        );
+        assert!(
+            voice_events
+                .iter()
+                .any(|event| matches!(event, VoiceEvent::VoiceTurnCancelled { .. })),
+            "cancelled interrupted turn should be observable: {voice_events:#?}"
+        );
+        assert!(matches!(
+            voice_events.last(),
+            Some(VoiceEvent::VoiceTurnCompleted {
+                output_chars: 15,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
     async fn voice_turn_runner_streams_audio_and_commits_completed_answer() {
         let provider = StaticTokenProvider::new(vec!["Hel", "lo"]);
         let tts = FakeTextToSpeech::new();
@@ -1199,6 +1436,12 @@ mod tests {
         events
     }
 
+    fn audio_stream_from_text(text: &'static str) -> BoxStream<'static, AudioChunk> {
+        Box::pin(futures_util::stream::iter(vec![
+            AudioChunk::new(text).with_elapsed_ms(1),
+        ]))
+    }
+
     async fn wait_for_count(count: &AtomicUsize, expected: usize) {
         timeout(Duration::from_secs(1), async {
             while count.load(Ordering::SeqCst) != expected {
@@ -1334,6 +1577,37 @@ mod tests {
             }
 
             Poll::Pending
+        }
+    }
+
+    struct InterruptibleProvider {
+        request_count: Arc<AtomicUsize>,
+    }
+
+    impl InterruptibleProvider {
+        fn new() -> Self {
+            Self {
+                request_count: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl LlmProvider for InterruptibleProvider {
+        fn stream_chat(&self, _req: ChatRequest) -> BoxStream<'static, LlmResult<TokenEvent>> {
+            match self.request_count.fetch_add(1, Ordering::SeqCst) {
+                0 => Box::pin(TokenThenHangingStream {
+                    token: Some("first partial".to_string()),
+                }),
+                _ => Box::pin(futures_util::stream::iter(vec![
+                    Ok(TokenEvent::Token {
+                        text: "second ".to_string(),
+                    }),
+                    Ok(TokenEvent::Token {
+                        text: "complete".to_string(),
+                    }),
+                    Ok(TokenEvent::Done),
+                ])),
+            }
         }
     }
 

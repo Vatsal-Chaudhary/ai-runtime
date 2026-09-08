@@ -380,6 +380,9 @@ async fn print_voice_events(mut events: mpsc::UnboundedReceiver<VoiceEvent>) {
             VoiceEvent::VoiceTurnCancelled { elapsed_ms } => {
                 println!("voice> turn_cancelled elapsed_ms={elapsed_ms}");
             }
+            VoiceEvent::VoiceTurnInterrupted { elapsed_ms } => {
+                println!("voice> turn_interrupted elapsed_ms={elapsed_ms}");
+            }
             VoiceEvent::VoiceTurnFailed { elapsed_ms } => {
                 println!("voice> turn_failed elapsed_ms={elapsed_ms}");
             }
