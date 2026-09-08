@@ -2,6 +2,8 @@ A streaming LLM orchestration + tool-calling + real-time voice runtime, built di
 
 Functional design document: [docs/fdd.md](docs/fdd.md)
 
+Manual voice provider smoke test: [docs/voice-smoke-test.md](docs/voice-smoke-test.md)
+
 Status: Voice runtime fake pipeline in progress
 
 ## CLI demo
