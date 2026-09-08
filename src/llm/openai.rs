@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::info;
 
-use super::{ChatMessage, ChatRequest, LlmError, LlmProvider, Result, TokenEvent};
+use super::{
+    ChatMessage, ChatRequest, LlmError, LlmProvider, Result, TokenEvent, ToolCall, ToolSpec,
+};
 
 static ACTIVE_STREAM_TASKS: AtomicUsize = AtomicUsize::new(0);
 
@@ -153,6 +155,35 @@ struct OpenAiChatRequest {
     model: String,
     messages: Vec<ChatMessage>,
     stream: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<OpenAiToolSpec>,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiToolSpec {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    function: OpenAiFunctionSpec,
+}
+
+#[derive(Debug, Serialize)]
+struct OpenAiFunctionSpec {
+    name: String,
+    description: String,
+    parameters: serde_json::Value,
+}
+
+impl From<ToolSpec> for OpenAiToolSpec {
+    fn from(spec: ToolSpec) -> Self {
+        Self {
+            kind: "function",
+            function: OpenAiFunctionSpec {
+                name: spec.name,
+                description: spec.description,
+                parameters: spec.parameters,
+            },
+        }
+    }
 }
 
 async fn run_stream(
@@ -168,6 +199,7 @@ async fn run_stream(
         model: req.model,
         messages: req.messages,
         stream: true,
+        tools: req.tools.into_iter().map(OpenAiToolSpec::from).collect(),
     };
 
     let started = Instant::now();
@@ -188,6 +220,7 @@ async fn run_stream(
     }
 
     let mut decoder = SseDecoder::default();
+    let mut tool_calls = OpenAiToolCallAccumulator::default();
     let mut byte_stream = response.bytes_stream();
     let mut first_token_recorded = false;
 
@@ -203,6 +236,19 @@ async fn run_stream(
                     if tx.send(Ok(TokenEvent::Token { text })).await.is_err() {
                         return Ok(());
                     }
+                }
+                ParsedOpenAiEvent::ToolCallDelta(deltas) => {
+                    tool_calls.push_all(deltas);
+                }
+                ParsedOpenAiEvent::FinishToolCalls => {
+                    for tool_call in tool_calls.drain_completed()? {
+                        if tx.send(Ok(TokenEvent::ToolCall(tool_call))).await.is_err() {
+                            return Ok(());
+                        }
+                    }
+
+                    let _ = tx.send(Ok(TokenEvent::Done)).await;
+                    return Ok(());
                 }
                 ParsedOpenAiEvent::Done => {
                     let _ = tx.send(Ok(TokenEvent::Done)).await;
@@ -313,13 +359,31 @@ struct OpenAiChoice {
     finish_reason: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct OpenAiDelta {
     content: Option<String>,
+    tool_calls: Option<Vec<OpenAiToolCallDelta>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiToolCallDelta {
+    index: usize,
+    id: Option<String>,
+    #[serde(rename = "type")]
+    kind: Option<String>,
+    function: Option<OpenAiFunctionDelta>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiFunctionDelta {
+    name: Option<String>,
+    arguments: Option<String>,
 }
 
 enum ParsedOpenAiEvent {
     Token(String),
+    ToolCallDelta(Vec<OpenAiToolCallDelta>),
+    FinishToolCalls,
     Done,
     Ignored,
 }
@@ -344,10 +408,110 @@ fn parse_openai_event(data: &str) -> Result<ParsedOpenAiEvent> {
         return Ok(ParsedOpenAiEvent::Token(content));
     }
 
+    if let Some(tool_calls) = choice.delta.tool_calls
+        && !tool_calls.is_empty()
+    {
+        return Ok(ParsedOpenAiEvent::ToolCallDelta(tool_calls));
+    }
+
+    if finish_reason_is(&choice.finish_reason, "tool_calls") {
+        return Ok(ParsedOpenAiEvent::FinishToolCalls);
+    }
+
     if choice.finish_reason.is_some() {
         Ok(ParsedOpenAiEvent::Done)
     } else {
         Ok(ParsedOpenAiEvent::Ignored)
+    }
+}
+
+fn finish_reason_is(value: &Option<serde_json::Value>, expected: &str) -> bool {
+    value
+        .as_ref()
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|actual| actual == expected)
+}
+
+#[derive(Default)]
+struct OpenAiToolCallAccumulator {
+    calls: BTreeMap<usize, PendingToolCall>,
+}
+
+impl OpenAiToolCallAccumulator {
+    fn push_all(&mut self, deltas: Vec<OpenAiToolCallDelta>) {
+        for delta in deltas {
+            let pending = self.calls.entry(delta.index).or_default();
+
+            if let Some(id) = delta.id {
+                pending.id = Some(id);
+            }
+
+            if let Some(kind) = delta.kind {
+                pending.kind = Some(kind);
+            }
+
+            if let Some(function) = delta.function {
+                if let Some(name) = function.name {
+                    pending.name = Some(name);
+                }
+                if let Some(arguments) = function.arguments {
+                    pending.arguments.push_str(&arguments);
+                }
+            }
+        }
+    }
+
+    fn drain_completed(&mut self) -> Result<Vec<ToolCall>> {
+        let calls = std::mem::take(&mut self.calls);
+        calls
+            .into_values()
+            .map(PendingToolCall::into_tool_call)
+            .collect()
+    }
+}
+
+#[derive(Default)]
+struct PendingToolCall {
+    id: Option<String>,
+    kind: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+impl PendingToolCall {
+    fn into_tool_call(self) -> Result<ToolCall> {
+        let id = self.id.ok_or_else(|| LlmError::MalformedSse {
+            message: "tool call delta completed without id".to_string(),
+        })?;
+
+        let name = self.name.ok_or_else(|| LlmError::MalformedSse {
+            message: format!("tool call {id} completed without function name"),
+        })?;
+
+        if let Some(kind) = self.kind
+            && kind != "function"
+        {
+            return Err(LlmError::MalformedSse {
+                message: format!("tool call {id} has unsupported type {kind:?}"),
+            });
+        }
+
+        let arguments = if self.arguments.trim().is_empty() {
+            serde_json::Value::Object(Default::default())
+        } else {
+            serde_json::from_str(&self.arguments).map_err(|err| LlmError::MalformedSse {
+                message: format!(
+                    "tool call {id} has invalid JSON arguments: {err}; data={:?}",
+                    self.arguments
+                ),
+            })?
+        };
+
+        Ok(ToolCall {
+            id,
+            name,
+            arguments,
+        })
     }
 }
 
@@ -444,6 +608,57 @@ mod tests {
             .expect_err("malformed chunk should be an error");
 
         assert!(matches!(err, LlmError::MalformedSse { .. }));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn streamed_tool_call_deltas_are_assembled() {
+        let _guard = TEST_LOCK.lock().await;
+        init_tracing();
+
+        let body = [
+            tool_call_delta(serde_json::json!({
+                "index": 0,
+                "id": "call_1",
+                "type": "function",
+                "function": {
+                    "name": "calculator",
+                    "arguments": "{\"operation\":\"add\","
+                }
+            })),
+            tool_call_delta(serde_json::json!({
+                "index": 0,
+                "function": { "arguments": "\"a\":20," }
+            })),
+            tool_call_delta(serde_json::json!({
+                "index": 0,
+                "function": { "arguments": "\"b\":22}" }
+            })),
+            r#"data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}"#.to_string(),
+            "\n\n".to_string(),
+        ]
+        .join("");
+        let server = MockSseServer::start([ServerWrite::bytes(body)]).await;
+        let provider = provider_for(&server, Duration::from_secs(5));
+
+        let events = collect_stream(provider.stream_chat(test_request()))
+            .await
+            .expect("stream should succeed");
+
+        assert_eq!(
+            events,
+            vec![
+                TokenEvent::ToolCall(ToolCall {
+                    id: "call_1".to_string(),
+                    name: "calculator".to_string(),
+                    arguments: serde_json::json!({
+                        "operation": "add",
+                        "a": 20,
+                        "b": 22
+                    }),
+                }),
+                TokenEvent::Done,
+            ]
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -565,6 +780,19 @@ mod tests {
                 "choices": [{
                     "delta": { "content": content },
                     "finish_reason": null
+                }]
+            })
+        )
+    }
+
+    fn tool_call_delta(delta: serde_json::Value) -> String {
+        format!(
+            "data: {}\n\n",
+            serde_json::json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [delta]
+                    }
                 }]
             })
         )
