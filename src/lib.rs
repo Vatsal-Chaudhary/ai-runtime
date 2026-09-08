@@ -18,7 +18,8 @@ pub use tools::{
 pub use voice::{
     AudioChunk, FakeSpeechToText, FakeTextToSpeech, FakeVoiceTransport, FakeVoiceTransportHandle,
     RuntimeTtsAdapter, SpeechToText, SttError, SttResult, TextToSpeech, TranscriptEvent,
-    TtsAdapterError, TtsError, TtsEvent, VoiceEvent, VoicePipelineRunner, VoiceSession,
-    VoiceSessionError, VoiceTransport, VoiceTransportError, VoiceTransportEvent, VoiceTurnError,
-    VoiceTurnOptions, VoiceTurnOutput, VoiceTurnRunner,
+    TtsAdapterError, TtsError, TtsEvent, VoiceEvent, VoiceLatencyMetric, VoiceLatencyRecorder,
+    VoiceLatencySnapshot, VoiceLatencyStats, VoicePipelineRunner, VoiceSession, VoiceSessionError,
+    VoiceTransport, VoiceTransportError, VoiceTransportEvent, VoiceTurnError, VoiceTurnOptions,
+    VoiceTurnOutput, VoiceTurnRunner,
 };

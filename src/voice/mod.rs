@@ -220,6 +220,117 @@ pub struct VoiceTurnOutput {
     pub text: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum VoiceLatencyMetric {
+    SttFinalization,
+    LlmFirstToken,
+    TtsFirstAudio,
+    VoiceTurnRoundTrip,
+}
+
+impl VoiceLatencyMetric {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::SttFinalization => "stt_finalization",
+            Self::LlmFirstToken => "llm_first_token",
+            Self::TtsFirstAudio => "tts_first_audio",
+            Self::VoiceTurnRoundTrip => "voice_turn_round_trip",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceLatencyStats {
+    pub samples: usize,
+    pub p50_ms: u128,
+    pub p95_ms: u128,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VoiceLatencySnapshot {
+    pub stt_finalization: Option<VoiceLatencyStats>,
+    pub llm_first_token: Option<VoiceLatencyStats>,
+    pub tts_first_audio: Option<VoiceLatencyStats>,
+    pub voice_turn_round_trip: Option<VoiceLatencyStats>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct VoiceLatencyRecorder {
+    stt_finalization: Vec<u128>,
+    llm_first_token: Vec<u128>,
+    tts_first_audio: Vec<u128>,
+    voice_turn_round_trip: Vec<u128>,
+}
+
+impl VoiceLatencyRecorder {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(&mut self, metric: VoiceLatencyMetric, elapsed_ms: u128) {
+        match metric {
+            VoiceLatencyMetric::SttFinalization => self.stt_finalization.push(elapsed_ms),
+            VoiceLatencyMetric::LlmFirstToken => self.llm_first_token.push(elapsed_ms),
+            VoiceLatencyMetric::TtsFirstAudio => self.tts_first_audio.push(elapsed_ms),
+            VoiceLatencyMetric::VoiceTurnRoundTrip => self.voice_turn_round_trip.push(elapsed_ms),
+        }
+    }
+
+    pub fn record_event(&mut self, event: &VoiceEvent) {
+        match event {
+            VoiceEvent::SttFinal { stt_elapsed_ms, .. } => {
+                self.record(VoiceLatencyMetric::SttFinalization, *stt_elapsed_ms);
+            }
+            VoiceEvent::LlmFirstToken {
+                runtime_elapsed_ms, ..
+            } => {
+                self.record(VoiceLatencyMetric::LlmFirstToken, *runtime_elapsed_ms);
+            }
+            VoiceEvent::TtsFirstAudio { tts_elapsed_ms, .. } => {
+                self.record(VoiceLatencyMetric::TtsFirstAudio, *tts_elapsed_ms);
+            }
+            VoiceEvent::VoiceTurnCompleted { elapsed_ms, .. } => {
+                self.record(VoiceLatencyMetric::VoiceTurnRoundTrip, *elapsed_ms);
+            }
+            VoiceEvent::SttPartial { .. }
+            | VoiceEvent::VoiceTurnCancelled { .. }
+            | VoiceEvent::VoiceTurnInterrupted { .. }
+            | VoiceEvent::VoiceTurnFailed { .. } => {}
+        }
+    }
+
+    pub fn snapshot(&self) -> VoiceLatencySnapshot {
+        VoiceLatencySnapshot {
+            stt_finalization: latency_stats(&self.stt_finalization),
+            llm_first_token: latency_stats(&self.llm_first_token),
+            tts_first_audio: latency_stats(&self.tts_first_audio),
+            voice_turn_round_trip: latency_stats(&self.voice_turn_round_trip),
+        }
+    }
+}
+
+fn latency_stats(samples: &[u128]) -> Option<VoiceLatencyStats> {
+    if samples.is_empty() {
+        return None;
+    }
+
+    let mut sorted = samples.to_vec();
+    sorted.sort_unstable();
+
+    Some(VoiceLatencyStats {
+        samples: sorted.len(),
+        p50_ms: percentile_nearest_rank(&sorted, 50),
+        p95_ms: percentile_nearest_rank(&sorted, 95),
+    })
+}
+
+fn percentile_nearest_rank(sorted_samples: &[u128], percentile: usize) -> u128 {
+    debug_assert!(!sorted_samples.is_empty());
+    let len = sorted_samples.len();
+    let rank = (percentile * len).div_ceil(100);
+    sorted_samples[rank.saturating_sub(1)]
+}
+
 pub struct VoiceTurnRunner<P, T> {
     runtime: AgentRuntime<P>,
     tts: RuntimeTtsAdapter<T>,
@@ -1685,6 +1796,82 @@ mod tests {
                 .iter()
                 .all(|chunk| chunk != &b"fake-tts:1:late".to_vec()),
             "late token was forwarded after cancellation: {late_chunks:?}"
+        );
+    }
+
+    #[test]
+    fn voice_latency_recorder_summarizes_nearest_rank_percentiles() {
+        let mut recorder = VoiceLatencyRecorder::new();
+
+        for elapsed_ms in [30, 10, 40, 20] {
+            recorder.record(VoiceLatencyMetric::LlmFirstToken, elapsed_ms);
+        }
+
+        assert_eq!(
+            recorder.snapshot().llm_first_token,
+            Some(VoiceLatencyStats {
+                samples: 4,
+                p50_ms: 20,
+                p95_ms: 40,
+            })
+        );
+    }
+
+    #[test]
+    fn voice_latency_recorder_ingests_voice_events() {
+        let mut recorder = VoiceLatencyRecorder::new();
+
+        for event in [
+            VoiceEvent::SttPartial {
+                elapsed_ms: 5,
+                stt_elapsed_ms: 5,
+                transcript_chars: 2,
+            },
+            VoiceEvent::SttFinal {
+                elapsed_ms: 15,
+                stt_elapsed_ms: 12,
+                transcript_chars: 8,
+            },
+            VoiceEvent::LlmFirstToken {
+                elapsed_ms: 30,
+                runtime_elapsed_ms: 18,
+            },
+            VoiceEvent::TtsFirstAudio {
+                elapsed_ms: 45,
+                tts_elapsed_ms: 9,
+            },
+            VoiceEvent::VoiceTurnCompleted {
+                elapsed_ms: 70,
+                output_chars: 11,
+            },
+        ] {
+            recorder.record_event(&event);
+        }
+
+        assert_eq!(
+            recorder.snapshot(),
+            VoiceLatencySnapshot {
+                stt_finalization: Some(VoiceLatencyStats {
+                    samples: 1,
+                    p50_ms: 12,
+                    p95_ms: 12,
+                }),
+                llm_first_token: Some(VoiceLatencyStats {
+                    samples: 1,
+                    p50_ms: 18,
+                    p95_ms: 18,
+                }),
+                tts_first_audio: Some(VoiceLatencyStats {
+                    samples: 1,
+                    p50_ms: 9,
+                    p95_ms: 9,
+                }),
+                voice_turn_round_trip: Some(VoiceLatencyStats {
+                    samples: 1,
+                    p50_ms: 70,
+                    p95_ms: 70,
+                }),
+            }
         );
     }
 

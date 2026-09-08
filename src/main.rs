@@ -9,7 +9,8 @@ use ai_runtime::{
     AgentRuntime, AudioChunk, CalculatorTool, ChatRequest, ConversationContext, FakeSpeechToText,
     FakeTextToSpeech, LlmProvider, MockCrmLookupTool, OpenAiCompatibleProvider, OpenAiConfig,
     RequestState, RunTurnOptions, RuntimeConfig, RuntimeError, RuntimeEvent, TokenEvent,
-    ToolRegistry, TtsEvent, VoiceEvent, VoicePipelineRunner, VoiceTurnError, VoiceTurnOptions,
+    ToolRegistry, TtsEvent, VoiceEvent, VoiceLatencyRecorder, VoiceLatencySnapshot,
+    VoiceLatencyStats, VoicePipelineRunner, VoiceTurnError, VoiceTurnOptions,
 };
 use futures_core::stream::BoxStream;
 use serde_json::json;
@@ -171,7 +172,8 @@ async fn voice_fake(args: Vec<String>) -> Result<(), Box<dyn Error>> {
         };
 
         let _ = tts_task.await;
-        let _ = voice_task.await;
+        let latency_snapshot = voice_task.await?;
+        print_voice_latency_snapshot(&latency_snapshot);
 
         match result {
             Ok(output) => println!("assistant-final> {}", output.text),
@@ -332,8 +334,14 @@ async fn print_tts_events(mut events: mpsc::UnboundedReceiver<TtsEvent>) {
     }
 }
 
-async fn print_voice_events(mut events: mpsc::UnboundedReceiver<VoiceEvent>) {
+async fn print_voice_events(
+    mut events: mpsc::UnboundedReceiver<VoiceEvent>,
+) -> VoiceLatencySnapshot {
+    let mut latency = VoiceLatencyRecorder::new();
+
     while let Some(event) = events.recv().await {
+        latency.record_event(&event);
+
         match event {
             VoiceEvent::SttPartial {
                 elapsed_ms,
@@ -387,6 +395,24 @@ async fn print_voice_events(mut events: mpsc::UnboundedReceiver<VoiceEvent>) {
                 println!("voice> turn_failed elapsed_ms={elapsed_ms}");
             }
         }
+    }
+
+    latency.snapshot()
+}
+
+fn print_voice_latency_snapshot(snapshot: &VoiceLatencySnapshot) {
+    print_voice_latency_stat("stt_finalization", snapshot.stt_finalization);
+    print_voice_latency_stat("llm_first_token", snapshot.llm_first_token);
+    print_voice_latency_stat("tts_first_audio", snapshot.tts_first_audio);
+    print_voice_latency_stat("voice_turn_round_trip", snapshot.voice_turn_round_trip);
+}
+
+fn print_voice_latency_stat(name: &str, stats: Option<VoiceLatencyStats>) {
+    if let Some(stats) = stats {
+        println!(
+            "voice-metrics> {name} samples={} p50_ms={} p95_ms={}",
+            stats.samples, stats.p50_ms, stats.p95_ms
+        );
     }
 }
 
