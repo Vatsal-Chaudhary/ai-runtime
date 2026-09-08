@@ -16,6 +16,7 @@ pub use tools::{
     CalculatorTool, MockCrmLookupTool, Tool, ToolDefinition, ToolError, ToolMetadata, ToolRegistry,
 };
 pub use voice::{
-    FakeTextToSpeech, RuntimeTtsAdapter, TextToSpeech, TtsAdapterError, TtsError, TtsEvent,
-    VoiceTurnError, VoiceTurnOptions, VoiceTurnOutput, VoiceTurnRunner,
+    AudioChunk, FakeSpeechToText, FakeTextToSpeech, RuntimeTtsAdapter, SpeechToText, SttError,
+    SttResult, TextToSpeech, TranscriptEvent, TtsAdapterError, TtsError, TtsEvent,
+    VoicePipelineRunner, VoiceTurnError, VoiceTurnOptions, VoiceTurnOutput, VoiceTurnRunner,
 };

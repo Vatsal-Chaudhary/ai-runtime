@@ -26,6 +26,33 @@ use crate::{
 };
 
 pub type Result<T> = std::result::Result<T, TtsError>;
+pub type SttResult<T> = std::result::Result<T, SttError>;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AudioChunk {
+    pub bytes: Vec<u8>,
+    pub elapsed_ms: u128,
+}
+
+impl AudioChunk {
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
+        Self {
+            bytes: bytes.into(),
+            elapsed_ms: 0,
+        }
+    }
+
+    pub fn with_elapsed_ms(mut self, elapsed_ms: u128) -> Self {
+        self.elapsed_ms = elapsed_ms;
+        self
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum SttError {
+    #[error("STT backend failed: {0}")]
+    Backend(String),
+}
 
 #[derive(Debug, Error)]
 pub enum TtsError {
@@ -38,6 +65,20 @@ pub enum TtsEvent {
     FirstAudio { elapsed_ms: u128 },
     AudioChunk { bytes: Vec<u8>, elapsed_ms: u128 },
     Done,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TranscriptEvent {
+    Partial { text: String, elapsed_ms: u128 },
+    Final { text: String, elapsed_ms: u128 },
+    Done,
+}
+
+pub trait SpeechToText: Send + Sync {
+    fn stream_audio(
+        &self,
+        audio: BoxStream<'static, AudioChunk>,
+    ) -> BoxStream<'static, SttResult<TranscriptEvent>>;
 }
 
 pub trait TextToSpeech: Send + Sync {
@@ -60,10 +101,16 @@ pub enum VoiceTurnError {
     Runtime(#[from] RuntimeError),
 
     #[error(transparent)]
+    Stt(#[from] SttError),
+
+    #[error(transparent)]
     Tts(#[from] TtsError),
 
     #[error("voice turn was cancelled")]
     Cancelled,
+
+    #[error("STT stream completed without a final transcript")]
+    MissingFinalTranscript,
 }
 
 #[derive(Debug, Clone)]
@@ -100,6 +147,65 @@ pub struct VoiceTurnOutput {
 pub struct VoiceTurnRunner<P, T> {
     runtime: AgentRuntime<P>,
     tts: RuntimeTtsAdapter<T>,
+}
+
+pub struct VoicePipelineRunner<P, S, T> {
+    stt: S,
+    turn: VoiceTurnRunner<P, T>,
+}
+
+impl<P, S, T> VoicePipelineRunner<P, S, T>
+where
+    P: LlmProvider,
+    S: SpeechToText,
+    T: TextToSpeech,
+{
+    pub fn new(provider: P, tools: ToolRegistry, config: RuntimeConfig, stt: S, tts: T) -> Self {
+        Self {
+            stt,
+            turn: VoiceTurnRunner::new(provider, tools, config, tts),
+        }
+    }
+
+    pub async fn run_audio_turn(
+        &self,
+        context: &mut ConversationContext,
+        audio: BoxStream<'static, AudioChunk>,
+    ) -> std::result::Result<VoiceTurnOutput, VoiceTurnError> {
+        self.run_audio_turn_with_options(context, audio, VoiceTurnOptions::default())
+            .await
+    }
+
+    pub async fn run_audio_turn_with_options(
+        &self,
+        context: &mut ConversationContext,
+        audio: BoxStream<'static, AudioChunk>,
+        options: VoiceTurnOptions,
+    ) -> std::result::Result<VoiceTurnOutput, VoiceTurnError> {
+        let cancellation_token = options.cancellation_token.clone();
+        let mut transcripts = self.stt.stream_audio(audio);
+
+        let transcript = loop {
+            tokio::select! {
+                _ = cancellation_token.cancelled() => return Err(VoiceTurnError::Cancelled),
+                event = transcripts.next() => {
+                    match event {
+                        Some(Ok(TranscriptEvent::Partial { .. })) => {}
+                        Some(Ok(TranscriptEvent::Final { text, .. })) => break text,
+                        Some(Ok(TranscriptEvent::Done)) | None => {
+                            return Err(VoiceTurnError::MissingFinalTranscript);
+                        }
+                        Some(Err(err)) => return Err(VoiceTurnError::Stt(err)),
+                    }
+                }
+            }
+        };
+
+        drop(transcripts);
+        self.turn
+            .run_transcript_with_options(context, transcript, options)
+            .await
+    }
 }
 
 impl<P, T> VoiceTurnRunner<P, T>
@@ -261,6 +367,101 @@ fn receiver_stream<T: Send + 'static>(rx: UnboundedReceiver<T>) -> BoxStream<'st
     Box::pin(futures_util::stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|item| (item, rx))
     }))
+}
+
+#[derive(Debug, Clone)]
+pub struct FakeSpeechToText {
+    active_streams: Arc<AtomicUsize>,
+}
+
+impl FakeSpeechToText {
+    pub fn new() -> Self {
+        Self {
+            active_streams: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn active_stream_count(&self) -> usize {
+        self.active_streams.load(Ordering::SeqCst)
+    }
+}
+
+impl Default for FakeSpeechToText {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SpeechToText for FakeSpeechToText {
+    fn stream_audio(
+        &self,
+        audio: BoxStream<'static, AudioChunk>,
+    ) -> BoxStream<'static, SttResult<TranscriptEvent>> {
+        self.active_streams.fetch_add(1, Ordering::SeqCst);
+        Box::pin(FakeSttStream {
+            audio,
+            transcript: String::new(),
+            last_elapsed_ms: 0,
+            pending: VecDeque::new(),
+            done_sent: false,
+            active_streams: Arc::clone(&self.active_streams),
+        })
+    }
+}
+
+struct FakeSttStream {
+    audio: BoxStream<'static, AudioChunk>,
+    transcript: String,
+    last_elapsed_ms: u128,
+    pending: VecDeque<TranscriptEvent>,
+    done_sent: bool,
+    active_streams: Arc<AtomicUsize>,
+}
+
+impl Stream for FakeSttStream {
+    type Item = SttResult<TranscriptEvent>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        if let Some(event) = this.pending.pop_front() {
+            return Poll::Ready(Some(Ok(event)));
+        }
+
+        if this.done_sent {
+            return Poll::Ready(None);
+        }
+
+        match this.audio.as_mut().poll_next(cx) {
+            Poll::Ready(Some(chunk)) => {
+                let fragment = String::from_utf8_lossy(&chunk.bytes);
+                this.transcript.push_str(&fragment);
+                this.last_elapsed_ms = chunk.elapsed_ms;
+                Poll::Ready(Some(Ok(TranscriptEvent::Partial {
+                    text: this.transcript.clone(),
+                    elapsed_ms: chunk.elapsed_ms,
+                })))
+            }
+            Poll::Ready(None) => {
+                this.done_sent = true;
+                if !this.transcript.is_empty() {
+                    this.pending.push_back(TranscriptEvent::Final {
+                        text: this.transcript.clone(),
+                        elapsed_ms: this.last_elapsed_ms,
+                    });
+                }
+                this.pending.push_back(TranscriptEvent::Done);
+                Poll::Ready(this.pending.pop_front().map(Ok))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+impl Drop for FakeSttStream {
+    fn drop(&mut self) {
+        self.active_streams.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -434,6 +635,132 @@ mod tests {
             vec![b"fake-tts:0:Hel".to_vec(), b"fake-tts:1:lo".to_vec()]
         );
         assert!(matches!(events.last(), Some(TtsEvent::Done)));
+    }
+
+    #[tokio::test]
+    async fn fake_stt_converts_audio_fragments_to_transcript_events() {
+        let stt = FakeSpeechToText::new();
+        let audio = Box::pin(futures_util::stream::iter(vec![
+            AudioChunk::new("hel").with_elapsed_ms(7),
+            AudioChunk::new("lo").with_elapsed_ms(11),
+        ]));
+
+        let events = stt
+            .stream_audio(audio)
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<SttResult<Vec<_>>>()
+            .expect("fake STT stream should succeed");
+
+        assert_eq!(
+            events,
+            vec![
+                TranscriptEvent::Partial {
+                    text: "hel".to_string(),
+                    elapsed_ms: 7,
+                },
+                TranscriptEvent::Partial {
+                    text: "hello".to_string(),
+                    elapsed_ms: 11,
+                },
+                TranscriptEvent::Final {
+                    text: "hello".to_string(),
+                    elapsed_ms: 11,
+                },
+                TranscriptEvent::Done,
+            ]
+        );
+        assert_eq!(stt.active_stream_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_pipeline_runner_uses_final_transcript_and_streams_tts_audio() {
+        let provider = StaticTokenProvider::new(vec!["Hi", " there"]);
+        let stt = FakeSpeechToText::new();
+        let tts = FakeTextToSpeech::new();
+        let pipeline = VoicePipelineRunner::new(
+            provider,
+            ToolRegistry::new(),
+            RuntimeConfig::new("test"),
+            stt,
+            tts,
+        );
+        let mut context = ConversationContext::new();
+        let (tts_tx, mut tts_rx) = mpsc::unbounded_channel();
+        let audio = Box::pin(futures_util::stream::iter(vec![
+            AudioChunk::new("hello").with_elapsed_ms(3),
+            AudioChunk::new(" runtime").with_elapsed_ms(9),
+        ]));
+
+        let output = pipeline
+            .run_audio_turn_with_options(
+                &mut context,
+                audio,
+                VoiceTurnOptions::default().with_tts_events(tts_tx),
+            )
+            .await
+            .expect("voice pipeline should succeed");
+
+        assert_eq!(output.text, "Hi there");
+        assert_eq!(context.messages()[0].role, "user");
+        assert_eq!(context.messages()[0].content, "hello runtime");
+        assert_eq!(
+            context
+                .messages()
+                .last()
+                .map(|message| message.content.as_str()),
+            Some("Hi there")
+        );
+
+        let events = drain_tts_events(&mut tts_rx);
+        assert_eq!(
+            audio_chunks(&events),
+            vec![b"fake-tts:0:Hi".to_vec(), b"fake-tts:1: there".to_vec()]
+        );
+        assert!(matches!(events.last(), Some(TtsEvent::Done)));
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_stt_streaming_drops_active_stt_stream() {
+        let provider = StaticTokenProvider::new(vec!["unused"]);
+        let stt = FakeSpeechToText::new();
+        let stt_probe = stt.clone();
+        let pipeline = VoicePipelineRunner::new(
+            provider,
+            ToolRegistry::new(),
+            RuntimeConfig::new("test"),
+            stt,
+            FakeTextToSpeech::new(),
+        );
+        let cancellation_token = CancellationToken::new();
+        let mut context = ConversationContext::new();
+        let (_audio_tx, audio_rx) = mpsc::unbounded_channel();
+        let audio = receiver_stream(audio_rx);
+
+        let result = {
+            let turn = pipeline.run_audio_turn_with_options(
+                &mut context,
+                audio,
+                VoiceTurnOptions::new(cancellation_token.clone()),
+            );
+            tokio::pin!(turn);
+
+            tokio::select! {
+                _ = wait_for_count_value(&stt_probe, 1) => {}
+                result = &mut turn => panic!("voice pipeline finished before cancellation: {result:?}"),
+            }
+
+            cancellation_token.cancel();
+
+            timeout(Duration::from_secs(1), &mut turn)
+                .await
+                .expect("voice pipeline should stop after cancellation")
+        };
+
+        assert!(matches!(result, Err(VoiceTurnError::Cancelled)));
+        assert!(context.messages().is_empty());
+        assert_eq!(stt_probe.active_stream_count(), 0);
     }
 
     #[tokio::test]
@@ -656,6 +983,16 @@ mod tests {
     async fn wait_for_count(count: &AtomicUsize, expected: usize) {
         timeout(Duration::from_secs(1), async {
             while count.load(Ordering::SeqCst) != expected {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("counter should reach expected value");
+    }
+
+    async fn wait_for_count_value(stt: &FakeSpeechToText, expected: usize) {
+        timeout(Duration::from_secs(1), async {
+            while stt.active_stream_count() != expected {
                 sleep(Duration::from_millis(10)).await;
             }
         })
