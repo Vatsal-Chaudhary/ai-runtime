@@ -26,10 +26,31 @@ Run the deterministic fake voice pipeline without API keys:
 cargo run -- voice-fake
 ```
 
+Smoke-test Deepgram TTS without LiveKit:
+
+```sh
+DEEPGRAM_API_KEY=... cargo run -- deepgram-tts-smoke "Hello from ai-runtime."
+```
+
+Smoke-test Deepgram STT with raw 16kHz mono linear16 PCM:
+
+```sh
+DEEPGRAM_API_KEY=... cargo run -- deepgram-stt-file ./sample.raw
+```
+
+Smoke-test Deepgram TTS and STT together without a microphone:
+
+```sh
+DEEPGRAM_API_KEY=... cargo run -- deepgram-loopback-smoke "Please transcribe this sentence."
+```
+
 Optional env vars:
 
 - `OPENAI_COMPAT_MODEL` defaults to `gpt-4o-mini`
 - `OPENAI_COMPAT_BASE_URL` defaults to `https://api.openai.com/v1`
+- `DEEPGRAM_LISTEN_URL` defaults to Nova-3 with interim results, smart formatting, 16kHz mono linear16 input, and 300ms endpointing
+- `DEEPGRAM_SPEAK_URL` defaults to Aura-2 Thalia with 24kHz linear16 output
+- `deepgram-loopback-smoke` overrides TTS output to 16kHz linear16 so it can feed the STT smoke path
 
 The CLI prints structured runtime events for lifecycle state, LLM first-token latency, tool dispatch start/end, tool timeouts, and turn completion. Press Ctrl-C during a turn to cancel the in-flight LLM stream or tool call.
 
@@ -67,4 +88,4 @@ Measurement boundaries:
 
 ## Remaining provider work
 
-The core runtime and fake backends are runnable without credentials. Real LiveKit transport and hosted STT/TTS provider adapters still need provider selection, API keys, and a manual mic/speaker smoke test.
+The core runtime and fake backends are runnable without credentials. Deepgram STT/TTS adapters are available for provider smoke tests. Real LiveKit transport still needs a manual mic/speaker smoke test.

@@ -3,22 +3,27 @@ use std::{
     env,
     error::Error,
     io::{self, Write},
+    time::Duration,
 };
 
 use ai_runtime::{
-    AgentRuntime, AudioChunk, CalculatorTool, ChatRequest, ConversationContext, FakeSpeechToText,
-    FakeTextToSpeech, LlmProvider, MockCrmLookupTool, OpenAiCompatibleProvider, OpenAiConfig,
-    RequestState, RunTurnOptions, RuntimeConfig, RuntimeError, RuntimeEvent, TokenEvent,
+    AgentRuntime, AudioChunk, CalculatorTool, ChatRequest, ConversationContext, DeepgramConfig,
+    DeepgramSpeechToText, DeepgramTextToSpeech, FakeSpeechToText, FakeTextToSpeech, LlmProvider,
+    MockCrmLookupTool, OpenAiCompatibleProvider, OpenAiConfig, RequestState, RunTurnOptions,
+    RuntimeConfig, RuntimeError, RuntimeEvent, SpeechToText, TextToSpeech, TokenEvent,
     ToolRegistry, TtsEvent, VoiceEvent, VoiceLatencyRecorder, VoiceLatencySnapshot,
     VoiceLatencyStats, VoicePipelineRunner, VoiceTurnError, VoiceTurnOptions,
 };
 use futures_core::stream::BoxStream;
+use futures_util::StreamExt;
 use serde_json::json;
 use tokio::{sync::mpsc, task};
 use tokio_util::sync::CancellationToken;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
+    let _ = dotenvy::dotenv();
+
     let mut args = env::args().skip(1);
     let Some(command) = args.next() else {
         print_usage();
@@ -28,6 +33,9 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match command.as_str() {
         "chat" => chat(args.collect()).await,
         "voice-fake" => voice_fake(args.collect()).await,
+        "deepgram-tts-smoke" => deepgram_tts_smoke(args.collect()).await,
+        "deepgram-stt-file" => deepgram_stt_file(args.collect()).await,
+        "deepgram-loopback-smoke" => deepgram_loopback_smoke(args.collect()).await,
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())
@@ -185,6 +193,108 @@ async fn voice_fake(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+async fn deepgram_tts_smoke(args: Vec<String>) -> Result<(), Box<dyn Error>> {
+    let text = parse_deepgram_tts_smoke_args(args)?;
+    let config = DeepgramConfig::from_env()?;
+    let tts = DeepgramTextToSpeech::new(config);
+    let mut events = tts.stream_text(Box::pin(futures_util::stream::iter(vec![text])));
+    let mut chunks = 0usize;
+    let mut bytes = 0usize;
+
+    while let Some(event) = events.next().await {
+        match event? {
+            TtsEvent::FirstAudio { elapsed_ms } => {
+                println!("deepgram-tts> first_audio elapsed_ms={elapsed_ms}");
+            }
+            TtsEvent::AudioChunk {
+                bytes: chunk,
+                elapsed_ms,
+            } => {
+                chunks += 1;
+                bytes += chunk.len();
+                println!(
+                    "deepgram-tts> audio_chunk elapsed_ms={elapsed_ms} bytes={}",
+                    chunk.len()
+                );
+            }
+            TtsEvent::Done => {
+                println!("deepgram-tts> done chunks={chunks} bytes={bytes}");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+async fn deepgram_stt_file(args: Vec<String>) -> Result<(), Box<dyn Error>> {
+    let path = parse_deepgram_stt_file_args(args)?;
+    let audio = std::fs::read(&path)?;
+    let config = DeepgramConfig::from_env()?;
+    let stt = DeepgramSpeechToText::new(config);
+    let mut events = stt.stream_audio(paced_audio_stream(raw_pcm_audio_chunks(&audio)));
+
+    print_deepgram_stt_events(&mut events).await
+}
+
+async fn deepgram_loopback_smoke(args: Vec<String>) -> Result<(), Box<dyn Error>> {
+    let text = parse_deepgram_loopback_smoke_args(args)?;
+    let config = DeepgramConfig::from_env()?;
+    let tts = DeepgramTextToSpeech::new(config.clone().with_speak_url(
+        "https://api.deepgram.com/v1/speak?model=aura-2-thalia-en&encoding=linear16&container=none&sample_rate=16000",
+    ));
+    let audio = collect_deepgram_tts_audio(&tts, text).await?;
+    println!(
+        "deepgram-loopback> synthesized_raw_pcm_bytes={}",
+        audio.len()
+    );
+
+    let stt = DeepgramSpeechToText::new(config);
+    let mut events = stt.stream_audio(paced_audio_stream(raw_pcm_audio_chunks(&audio)));
+    print_deepgram_stt_events(&mut events).await
+}
+
+async fn collect_deepgram_tts_audio(
+    tts: &DeepgramTextToSpeech,
+    text: String,
+) -> Result<Vec<u8>, Box<dyn Error>> {
+    let mut events = tts.stream_text(Box::pin(futures_util::stream::iter(vec![text])));
+    let mut audio = Vec::new();
+
+    while let Some(event) = events.next().await {
+        match event? {
+            TtsEvent::FirstAudio { elapsed_ms } => {
+                println!("deepgram-tts> first_audio elapsed_ms={elapsed_ms}");
+            }
+            TtsEvent::AudioChunk { bytes, .. } => audio.extend(bytes),
+            TtsEvent::Done => break,
+        }
+    }
+
+    Ok(audio)
+}
+
+async fn print_deepgram_stt_events(
+    events: &mut BoxStream<'static, ai_runtime::SttResult<ai_runtime::TranscriptEvent>>,
+) -> Result<(), Box<dyn Error>> {
+    while let Some(event) = events.next().await {
+        match event? {
+            ai_runtime::TranscriptEvent::Partial { text, elapsed_ms } => {
+                println!("deepgram-stt> partial elapsed_ms={elapsed_ms} text={text:?}");
+            }
+            ai_runtime::TranscriptEvent::Final { text, elapsed_ms } => {
+                println!("deepgram-stt> final elapsed_ms={elapsed_ms} text={text:?}");
+            }
+            ai_runtime::TranscriptEvent::Done => {
+                println!("deepgram-stt> done");
+                break;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 fn parse_chat_args(args: Vec<String>) -> Result<bool, Box<dyn Error>> {
     let mut tools_enabled = false;
 
@@ -215,6 +325,53 @@ fn parse_voice_fake_args(args: Vec<String>) -> Result<(), Box<dyn Error>> {
     }
 
     Ok(())
+}
+
+fn parse_deepgram_tts_smoke_args(args: Vec<String>) -> Result<String, Box<dyn Error>> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    {
+        print_deepgram_tts_smoke_usage();
+        std::process::exit(0);
+    }
+
+    if args.is_empty() {
+        Ok("Hello from the Deepgram TTS smoke test.".to_string())
+    } else {
+        Ok(args.join(" "))
+    }
+}
+
+fn parse_deepgram_stt_file_args(args: Vec<String>) -> Result<String, Box<dyn Error>> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    {
+        print_deepgram_stt_file_usage();
+        std::process::exit(0);
+    }
+
+    match args.as_slice() {
+        [path] => Ok(path.clone()),
+        _ => Err("usage: ai-runtime deepgram-stt-file <raw-16khz-mono-linear16-pcm-file>".into()),
+    }
+}
+
+fn parse_deepgram_loopback_smoke_args(args: Vec<String>) -> Result<String, Box<dyn Error>> {
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    {
+        print_deepgram_loopback_smoke_usage();
+        std::process::exit(0);
+    }
+
+    if args.is_empty() {
+        Ok("Hello from the Deepgram loopback smoke test.".to_string())
+    } else {
+        Ok(args.join(" "))
+    }
 }
 
 fn demo_tools() -> Result<ToolRegistry, Box<dyn Error>> {
@@ -250,6 +407,30 @@ fn fake_audio_chunks(text: &str) -> Vec<AudioChunk> {
             AudioChunk::new(fragment.as_bytes().to_vec()).with_elapsed_ms(elapsed_ms)
         })
         .collect()
+}
+
+fn raw_pcm_audio_chunks(bytes: &[u8]) -> Vec<AudioChunk> {
+    const CHUNK_BYTES: usize = 3_200;
+    const CHUNK_MS: u128 = 100;
+
+    bytes
+        .chunks(CHUNK_BYTES)
+        .enumerate()
+        .map(|(index, chunk)| {
+            AudioChunk::new(chunk.to_vec()).with_elapsed_ms((index as u128 + 1) * CHUNK_MS)
+        })
+        .collect()
+}
+
+fn paced_audio_stream(chunks: Vec<AudioChunk>) -> BoxStream<'static, AudioChunk> {
+    Box::pin(futures_util::stream::unfold(
+        chunks.into_iter(),
+        |mut chunks| async move {
+            let chunk = chunks.next()?;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            Some((chunk, chunks))
+        },
+    ))
 }
 
 async fn print_events(mut events: mpsc::UnboundedReceiver<RuntimeEvent>) {
@@ -438,7 +619,11 @@ fn print_usage() {
     println!("usage:");
     println!("  ai-runtime chat [--tools|--no-tools]");
     println!("  ai-runtime voice-fake");
+    println!("  ai-runtime deepgram-tts-smoke [text]");
+    println!("  ai-runtime deepgram-stt-file <raw-16khz-mono-linear16-pcm-file>");
+    println!("  ai-runtime deepgram-loopback-smoke [text]");
     println!("env for chat: OPENAI_COMPAT_API_KEY, OPENAI_COMPAT_MODEL, OPENAI_COMPAT_BASE_URL");
+    println!("env for Deepgram: DEEPGRAM_API_KEY, DEEPGRAM_LISTEN_URL, DEEPGRAM_SPEAK_URL");
 }
 
 fn print_chat_usage() {
@@ -451,6 +636,23 @@ fn print_voice_fake_usage() {
     println!("usage: ai-runtime voice-fake");
     println!(
         "  Runs typed text through fake audio, fake STT, deterministic LLM tokens, and fake TTS."
+    );
+}
+
+fn print_deepgram_tts_smoke_usage() {
+    println!("usage: ai-runtime deepgram-tts-smoke [text]");
+    println!("  Streams Deepgram Aura-2 TTS audio and prints chunk sizes.");
+}
+
+fn print_deepgram_stt_file_usage() {
+    println!("usage: ai-runtime deepgram-stt-file <raw-16khz-mono-linear16-pcm-file>");
+    println!("  Streams raw PCM bytes into Deepgram STT and prints transcript events.");
+}
+
+fn print_deepgram_loopback_smoke_usage() {
+    println!("usage: ai-runtime deepgram-loopback-smoke [text]");
+    println!(
+        "  Synthesizes 16kHz linear16 audio with Deepgram TTS, then transcribes it with Deepgram STT."
     );
 }
 
@@ -501,5 +703,20 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![40, 80, 120]
         );
+    }
+
+    #[test]
+    fn raw_pcm_audio_chunks_assign_100ms_boundaries() {
+        let input = vec![7; 6_500];
+
+        let chunks = raw_pcm_audio_chunks(&input);
+
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[0].bytes.len(), 3_200);
+        assert_eq!(chunks[0].elapsed_ms, 100);
+        assert_eq!(chunks[1].bytes.len(), 3_200);
+        assert_eq!(chunks[1].elapsed_ms, 200);
+        assert_eq!(chunks[2].bytes.len(), 100);
+        assert_eq!(chunks[2].elapsed_ms, 300);
     }
 }

@@ -28,6 +28,8 @@ use crate::{
     tools::ToolRegistry,
 };
 
+pub mod deepgram;
+
 pub type Result<T> = std::result::Result<T, TtsError>;
 pub type SttResult<T> = std::result::Result<T, SttError>;
 

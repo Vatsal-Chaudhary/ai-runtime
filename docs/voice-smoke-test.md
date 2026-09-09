@@ -10,6 +10,17 @@ Use this checklist when wiring a real LiveKit transport and hosted STT/TTS adapt
 - Microphone and speaker are available on the machine running the demo.
 - `cargo test` passes before starting the manual smoke test.
 
+## Provider Smoke Tests
+
+1. Export the Deepgram API key into the shell running the command.
+2. Run `cargo run -- deepgram-tts-smoke "Hello from ai-runtime."`.
+3. Confirm it prints `first_audio`, at least one `audio_chunk`, and `done`.
+4. Run `cargo run -- deepgram-loopback-smoke "Please transcribe this sentence."`.
+5. Confirm it synthesizes raw PCM bytes, then prints STT transcript events.
+6. Stream an external raw 16kHz mono linear16 PCM sample with `cargo run -- deepgram-stt-file ./sample.raw`.
+7. Confirm it prints interim `partial` events and at least one `final` transcript.
+8. Keep the default listen URL unless the audio source uses a different encoding or sample rate.
+
 ## Happy Path
 
 1. Start the voice demo with a fresh conversation context.

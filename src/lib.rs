@@ -22,4 +22,8 @@ pub use voice::{
     VoiceLatencySnapshot, VoiceLatencyStats, VoicePipelineRunner, VoiceSession, VoiceSessionError,
     VoiceTransport, VoiceTransportError, VoiceTransportEvent, VoiceTurnError, VoiceTurnOptions,
     VoiceTurnOutput, VoiceTurnRunner,
+    deepgram::{
+        DeepgramConfig, DeepgramConfigError, DeepgramSpeechToText, DeepgramTextToSpeech,
+        active_deepgram_stt_stream_count, active_deepgram_tts_stream_count,
+    },
 };
