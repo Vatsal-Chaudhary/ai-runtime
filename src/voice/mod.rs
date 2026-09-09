@@ -29,6 +29,7 @@ use crate::{
 };
 
 pub mod deepgram;
+pub mod livekit;
 
 pub type Result<T> = std::result::Result<T, TtsError>;
 pub type SttResult<T> = std::result::Result<T, SttError>;

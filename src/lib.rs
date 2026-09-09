@@ -26,4 +26,11 @@ pub use voice::{
         DeepgramConfig, DeepgramConfigError, DeepgramSpeechToText, DeepgramTextToSpeech,
         active_deepgram_stt_stream_count, active_deepgram_tts_stream_count,
     },
+    livekit::{
+        LiveKitConfig, LiveKitConfigError, LiveKitTransportError, linear16_bytes_to_samples,
+        linear16_samples_to_bytes,
+    },
 };
+
+#[cfg(feature = "livekit-transport")]
+pub use voice::livekit::LiveKitVoiceTransport;

@@ -8,12 +8,14 @@ use std::{
 
 use ai_runtime::{
     AgentRuntime, AudioChunk, CalculatorTool, ChatRequest, ConversationContext, DeepgramConfig,
-    DeepgramSpeechToText, DeepgramTextToSpeech, FakeSpeechToText, FakeTextToSpeech, LlmProvider,
-    MockCrmLookupTool, OpenAiCompatibleProvider, OpenAiConfig, RequestState, RunTurnOptions,
-    RuntimeConfig, RuntimeError, RuntimeEvent, SpeechToText, TextToSpeech, TokenEvent,
-    ToolRegistry, TtsEvent, VoiceEvent, VoiceLatencyRecorder, VoiceLatencySnapshot,
+    DeepgramSpeechToText, DeepgramTextToSpeech, FakeSpeechToText, FakeTextToSpeech, LiveKitConfig,
+    LlmProvider, MockCrmLookupTool, OpenAiCompatibleProvider, OpenAiConfig, RequestState,
+    RunTurnOptions, RuntimeConfig, RuntimeError, RuntimeEvent, SpeechToText, TextToSpeech,
+    TokenEvent, ToolRegistry, TtsEvent, VoiceEvent, VoiceLatencyRecorder, VoiceLatencySnapshot,
     VoiceLatencyStats, VoicePipelineRunner, VoiceTurnError, VoiceTurnOptions,
 };
+#[cfg(feature = "livekit-transport")]
+use ai_runtime::{LiveKitVoiceTransport, VoiceSession};
 use futures_core::stream::BoxStream;
 use futures_util::StreamExt;
 use serde_json::json;
@@ -36,6 +38,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
         "deepgram-tts-smoke" => deepgram_tts_smoke(args.collect()).await,
         "deepgram-stt-file" => deepgram_stt_file(args.collect()).await,
         "deepgram-loopback-smoke" => deepgram_loopback_smoke(args.collect()).await,
+        "livekit-token-smoke" => livekit_token_smoke(args.collect()).await,
+        "voice-livekit" => voice_livekit(args.collect()).await,
         "-h" | "--help" | "help" => {
             print_usage();
             Ok(())
@@ -254,6 +258,88 @@ async fn deepgram_loopback_smoke(args: Vec<String>) -> Result<(), Box<dyn Error>
     print_deepgram_stt_events(&mut events).await
 }
 
+async fn livekit_token_smoke(args: Vec<String>) -> Result<(), Box<dyn Error>> {
+    parse_livekit_token_smoke_args(args)?;
+    let config = LiveKitConfig::from_env()?;
+    let token = config.access_token()?;
+
+    println!(
+        "livekit-token> url={} room={} identity={} token_bytes={}",
+        config.url,
+        config.room,
+        config.identity,
+        token.len()
+    );
+
+    Ok(())
+}
+
+#[cfg(feature = "livekit-transport")]
+async fn voice_livekit(args: Vec<String>) -> Result<(), Box<dyn Error>> {
+    let tools_enabled = parse_voice_livekit_args(args)?;
+    let livekit = LiveKitConfig::from_env()?;
+    let deepgram = DeepgramConfig::from_env()?;
+    let api_key = env::var("OPENAI_COMPAT_API_KEY")
+        .map_err(|_| "OPENAI_COMPAT_API_KEY must be set to run `ai-runtime voice-livekit`")?;
+    let base_url =
+        env::var("OPENAI_COMPAT_BASE_URL").unwrap_or_else(|_| "https://api.openai.com/v1".into());
+    let model = env::var("OPENAI_COMPAT_MODEL").unwrap_or_else(|_| "gpt-4o-mini".into());
+
+    let provider = OpenAiCompatibleProvider::new(OpenAiConfig::new(base_url, api_key))?;
+    let tools = if tools_enabled {
+        demo_tools()?
+    } else {
+        ToolRegistry::new()
+    };
+    let transport = LiveKitVoiceTransport::connect(livekit.clone()).await?;
+    let (voice_tx, voice_rx) = mpsc::unbounded_channel();
+    let voice_task = task::spawn(print_voice_events(voice_rx));
+    let mut session = VoiceSession::new(
+        provider,
+        tools,
+        RuntimeConfig::new(model),
+        DeepgramSpeechToText::new(deepgram.clone()),
+        DeepgramTextToSpeech::new(deepgram),
+        ConversationContext::with_system_prompt("You are a concise real-time voice assistant."),
+    )
+    .with_voice_events(voice_tx);
+
+    println!(
+        "voice-livekit> joined room={} identity={}",
+        livekit.room, livekit.identity
+    );
+    println!("voice-livekit> speak from another LiveKit participant; press Ctrl-C to stop");
+
+    let result = {
+        let run = session.run_transport(transport);
+        tokio::pin!(run);
+        tokio::select! {
+            result = &mut run => result,
+            signal = tokio::signal::ctrl_c() => {
+                signal?;
+                Ok(())
+            }
+        }
+    };
+
+    session.cancel_active_turn().await?;
+    drop(session);
+    let latency_snapshot = voice_task.await?;
+    print_voice_latency_snapshot(&latency_snapshot);
+
+    result?;
+    Ok(())
+}
+
+#[cfg(not(feature = "livekit-transport"))]
+async fn voice_livekit(args: Vec<String>) -> Result<(), Box<dyn Error>> {
+    parse_voice_livekit_args(args)?;
+    Err(
+        "voice-livekit requires `cargo run --features livekit-transport -- voice-livekit`; this machine also needs clang++ 21+ for LiveKit WebRTC"
+            .into(),
+    )
+}
+
 async fn collect_deepgram_tts_audio(
     tts: &DeepgramTextToSpeech,
     text: String,
@@ -372,6 +458,38 @@ fn parse_deepgram_loopback_smoke_args(args: Vec<String>) -> Result<String, Box<d
     } else {
         Ok(args.join(" "))
     }
+}
+
+fn parse_livekit_token_smoke_args(args: Vec<String>) -> Result<(), Box<dyn Error>> {
+    for arg in args {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print_livekit_token_smoke_usage();
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown livekit-token-smoke option: {other}").into()),
+        }
+    }
+
+    Ok(())
+}
+
+fn parse_voice_livekit_args(args: Vec<String>) -> Result<bool, Box<dyn Error>> {
+    let mut tools_enabled = false;
+
+    for arg in args {
+        match arg.as_str() {
+            "--tools" => tools_enabled = true,
+            "--no-tools" => tools_enabled = false,
+            "-h" | "--help" => {
+                print_voice_livekit_usage();
+                std::process::exit(0);
+            }
+            other => return Err(format!("unknown voice-livekit option: {other}").into()),
+        }
+    }
+
+    Ok(tools_enabled)
 }
 
 fn demo_tools() -> Result<ToolRegistry, Box<dyn Error>> {
@@ -622,8 +740,11 @@ fn print_usage() {
     println!("  ai-runtime deepgram-tts-smoke [text]");
     println!("  ai-runtime deepgram-stt-file <raw-16khz-mono-linear16-pcm-file>");
     println!("  ai-runtime deepgram-loopback-smoke [text]");
+    println!("  ai-runtime livekit-token-smoke");
+    println!("  ai-runtime voice-livekit [--tools|--no-tools]");
     println!("env for chat: OPENAI_COMPAT_API_KEY, OPENAI_COMPAT_MODEL, OPENAI_COMPAT_BASE_URL");
     println!("env for Deepgram: DEEPGRAM_API_KEY, DEEPGRAM_LISTEN_URL, DEEPGRAM_SPEAK_URL");
+    println!("env for LiveKit: LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET");
 }
 
 fn print_chat_usage() {
@@ -654,6 +775,21 @@ fn print_deepgram_loopback_smoke_usage() {
     println!(
         "  Synthesizes 16kHz linear16 audio with Deepgram TTS, then transcribes it with Deepgram STT."
     );
+}
+
+fn print_livekit_token_smoke_usage() {
+    println!("usage: ai-runtime livekit-token-smoke");
+    println!(
+        "  Loads LiveKit env vars and generates a room join token without printing the token."
+    );
+}
+
+fn print_voice_livekit_usage() {
+    println!("usage: ai-runtime voice-livekit [--tools|--no-tools]");
+    println!(
+        "  Runs LiveKit audio transport with Deepgram STT/TTS and the OpenAI-compatible LLM provider."
+    );
+    println!("  Build with: cargo run --features livekit-transport -- voice-livekit");
 }
 
 struct FakeVoiceProvider;

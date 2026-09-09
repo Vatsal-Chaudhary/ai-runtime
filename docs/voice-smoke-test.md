@@ -9,6 +9,7 @@ Use this checklist when wiring a real LiveKit transport and hosted STT/TTS adapt
 - TTS provider API key is configured.
 - Microphone and speaker are available on the machine running the demo.
 - `cargo test` passes before starting the manual smoke test.
+- `clang++` 21 or newer is available when building `--features livekit-transport`.
 
 ## Provider Smoke Tests
 
@@ -20,6 +21,16 @@ Use this checklist when wiring a real LiveKit transport and hosted STT/TTS adapt
 6. Stream an external raw 16kHz mono linear16 PCM sample with `cargo run -- deepgram-stt-file ./sample.raw`.
 7. Confirm it prints interim `partial` events and at least one `final` transcript.
 8. Keep the default listen URL unless the audio source uses a different encoding or sample rate.
+
+## LiveKit Smoke Tests
+
+1. Export or populate `.env` with `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET`.
+2. Run `cargo run -- livekit-token-smoke`.
+3. Confirm it prints the configured URL, room, identity, and token byte length without printing the token.
+4. Build the transport with `cargo test --features livekit-transport` after selecting `clang++` 21 or newer.
+5. Start the room bridge with `cargo run --features livekit-transport -- voice-livekit`.
+6. Join the same `LIVEKIT_ROOM` from another LiveKit client with a microphone.
+7. Confirm incoming mic audio creates transcript events and assistant audio publishes as the `assistant-audio` track.
 
 ## Happy Path
 

@@ -3,11 +3,17 @@ name = "ai-runtime"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+livekit-transport = ["dep:livekit"]
+
 [dependencies]
 bytes = "1"
 dotenvy = "0.15"
 futures-core = "0.3"
 futures-util = { version = "0.3", features = ["sink"] }
+livekit = { version = "0.9", features = ["rustls-tls-webpki-roots"], optional = true }
+livekit-api = { version = "0.7", default-features = false, features = ["access-token"] }
 reqwest = { version = "0.12", features = ["json", "stream"] }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1", features = ["derive"] }
