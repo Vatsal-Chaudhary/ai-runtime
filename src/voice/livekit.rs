@@ -38,6 +38,8 @@ const DEFAULT_INPUT_MIN_SPEECH_MS: u64 = 120;
 const DEFAULT_INPUT_SILENCE_TIMEOUT_MS: u64 = 700;
 const DEFAULT_OUTPUT_SAMPLE_RATE: u32 = 24_000;
 const DEFAULT_OUTPUT_CHANNELS: u32 = 1;
+const DEFAULT_OUTPUT_BUFFER_MS: u32 = 100;
+const DEFAULT_OUTPUT_FRAME_MS: u32 = 20;
 const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone)]
@@ -55,6 +57,8 @@ pub struct LiveKitConfig {
     pub input_silence_timeout: Duration,
     pub output_sample_rate: u32,
     pub output_channels: u32,
+    pub output_buffer_ms: u32,
+    pub output_frame_ms: u32,
     pub token_ttl: Duration,
 }
 
@@ -78,6 +82,8 @@ impl LiveKitConfig {
             input_silence_timeout: Duration::from_millis(DEFAULT_INPUT_SILENCE_TIMEOUT_MS),
             output_sample_rate: DEFAULT_OUTPUT_SAMPLE_RATE,
             output_channels: DEFAULT_OUTPUT_CHANNELS,
+            output_buffer_ms: DEFAULT_OUTPUT_BUFFER_MS,
+            output_frame_ms: DEFAULT_OUTPUT_FRAME_MS,
             token_ttl: DEFAULT_TOKEN_TTL,
         }
     }
@@ -110,6 +116,10 @@ impl LiveKitConfig {
             optional_u32_env("LIVEKIT_OUTPUT_SAMPLE_RATE")?.unwrap_or(DEFAULT_OUTPUT_SAMPLE_RATE);
         config.output_channels =
             optional_u32_env("LIVEKIT_OUTPUT_CHANNELS")?.unwrap_or(DEFAULT_OUTPUT_CHANNELS);
+        config.output_buffer_ms =
+            optional_u32_env("LIVEKIT_OUTPUT_BUFFER_MS")?.unwrap_or(DEFAULT_OUTPUT_BUFFER_MS);
+        config.output_frame_ms =
+            optional_u32_env("LIVEKIT_OUTPUT_FRAME_MS")?.unwrap_or(DEFAULT_OUTPUT_FRAME_MS);
 
         Ok(config)
     }
@@ -150,6 +160,12 @@ impl LiveKitConfig {
     pub fn with_output_audio(mut self, sample_rate: u32, channels: u32) -> Self {
         self.output_sample_rate = sample_rate;
         self.output_channels = channels;
+        self
+    }
+
+    pub fn with_output_buffering(mut self, buffer_ms: u32, frame_ms: u32) -> Self {
+        self.output_buffer_ms = buffer_ms;
+        self.output_frame_ms = frame_ms;
         self
     }
 
@@ -287,7 +303,7 @@ impl LiveKitAudioOutput {
             AudioSourceOptions::default(),
             config.output_sample_rate,
             config.output_channels,
-            1000,
+            config.output_buffer_ms,
         );
         let track = LocalAudioTrack::create_audio_track(
             "assistant-audio",
@@ -501,16 +517,23 @@ async fn tts_playback_task(
                     continue;
                 }
 
-                let frame = AudioFrame {
-                    data: samples.as_slice().into(),
-                    sample_rate: config.output_sample_rate,
-                    num_channels: config.output_channels,
-                    samples_per_channel: samples.len() as u32 / config.output_channels,
-                };
+                let frame_samples = output_frame_sample_count(
+                    config.output_sample_rate,
+                    config.output_channels,
+                    config.output_frame_ms,
+                );
+                for frame_samples in samples.chunks(frame_samples) {
+                    let frame = AudioFrame {
+                        data: frame_samples.into(),
+                        sample_rate: config.output_sample_rate,
+                        num_channels: config.output_channels,
+                        samples_per_channel: frame_samples.len() as u32 / config.output_channels,
+                    };
 
-                if let Err(err) = source.capture_frame(&frame).await {
-                    warn!("LiveKit audio frame capture failed: {err}");
-                    break;
+                    if let Err(err) = source.capture_frame(&frame).await {
+                        warn!("LiveKit audio frame capture failed: {err}");
+                        break;
+                    }
                 }
             }
             TtsEvent::Done => {
@@ -618,6 +641,12 @@ fn frame_has_speech(samples: &[i16], speech_threshold: u32) -> bool {
     average_abs >= speech_threshold as u64
 }
 
+#[cfg(any(feature = "livekit-transport", test))]
+fn output_frame_sample_count(sample_rate: u32, channels: u32, frame_ms: u32) -> usize {
+    let samples_per_channel = (sample_rate as usize * frame_ms.max(1) as usize / 1000).max(1);
+    samples_per_channel * channels.max(1) as usize
+}
+
 #[cfg(feature = "livekit-transport")]
 fn audio_frame_elapsed_ms(sample_rate: u32, samples_per_channel: u32) -> u128 {
     if sample_rate == 0 {
@@ -689,6 +718,13 @@ mod tests {
         assert!(!frame_has_speech(&[0, 10, -10, 20], 250));
         assert!(frame_has_speech(&[300, -400, 500, -600], 250));
         assert!(frame_has_speech(&[i16::MIN], 250));
+    }
+
+    #[test]
+    fn output_frame_sample_count_uses_channels_and_frame_duration() {
+        assert_eq!(output_frame_sample_count(24_000, 1, 20), 480);
+        assert_eq!(output_frame_sample_count(48_000, 2, 10), 960);
+        assert_eq!(output_frame_sample_count(16_000, 0, 0), 16);
     }
 
     #[cfg(feature = "livekit-transport")]

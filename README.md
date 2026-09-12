@@ -70,6 +70,7 @@ Optional env vars:
 - `LIVEKIT_INPUT_MIN_SPEECH_MS` defaults to `120`; raise it if noise creates empty turns
 - `LIVEKIT_INPUT_SILENCE_TIMEOUT_MS` defaults to `700`
 - `LIVEKIT_OUTPUT_SAMPLE_RATE`/`LIVEKIT_OUTPUT_CHANNELS` default to 24kHz mono
+- `LIVEKIT_OUTPUT_BUFFER_MS` defaults to `100` and `LIVEKIT_OUTPUT_FRAME_MS` defaults to `20` to keep barge-in playback responsive
 
 The CLI prints structured runtime events for lifecycle state, LLM first-token latency, tool dispatch start/end, tool timeouts, and turn completion. Press Ctrl-C during a turn to cancel the in-flight LLM stream or tool call.
 
