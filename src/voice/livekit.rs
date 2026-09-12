@@ -35,7 +35,7 @@ const DEFAULT_INPUT_SAMPLE_RATE: u32 = 16_000;
 const DEFAULT_INPUT_CHANNELS: u32 = 1;
 const DEFAULT_INPUT_SPEECH_THRESHOLD: u32 = 250;
 const DEFAULT_INPUT_MIN_SPEECH_MS: u64 = 120;
-const DEFAULT_INPUT_SILENCE_TIMEOUT_MS: u64 = 700;
+const DEFAULT_INPUT_SILENCE_TIMEOUT_MS: u64 = 400;
 const DEFAULT_OUTPUT_SAMPLE_RATE: u32 = 24_000;
 const DEFAULT_OUTPUT_CHANNELS: u32 = 1;
 const DEFAULT_OUTPUT_BUFFER_MS: u32 = 100;
@@ -413,6 +413,7 @@ impl Default for ActiveLiveKitAudioTurn {
 struct PendingLiveKitFrame {
     bytes: Vec<u8>,
     frame_ms: u128,
+    speech: bool,
 }
 
 #[cfg(feature = "livekit-transport")]
@@ -428,6 +429,7 @@ impl ActiveLiveKitAudioTurn {
         let pending_frame = PendingLiveKitFrame {
             bytes: linear16_samples_to_bytes(frame.data.as_ref()),
             frame_ms,
+            speech,
         };
 
         if self.tx.is_none() {
@@ -482,6 +484,7 @@ impl ActiveLiveKitAudioTurn {
         let chunk = AudioChunk {
             bytes: pending_frame.bytes,
             elapsed_ms: self.elapsed_ms,
+            is_speech: Some(speech),
         };
         let close_after_send =
             !speech && self.silence_ms >= config.input_silence_timeout.as_millis();
@@ -505,6 +508,7 @@ impl ActiveLiveKitAudioTurn {
             chunks.push(AudioChunk {
                 bytes: frame.bytes,
                 elapsed_ms: self.elapsed_ms,
+                is_speech: Some(frame.speech),
             });
         }
         self.pending_speech_ms = 0;

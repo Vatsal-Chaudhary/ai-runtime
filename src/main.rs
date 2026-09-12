@@ -375,6 +375,7 @@ async fn print_deepgram_stt_events(
             ai_runtime::TranscriptEvent::Final { text, elapsed_ms } => {
                 println!("deepgram-stt> final elapsed_ms={elapsed_ms} text={text:?}");
             }
+            ai_runtime::TranscriptEvent::Breakdown(_) => {}
             ai_runtime::TranscriptEvent::Done => {
                 println!("deepgram-stt> done");
                 break;
@@ -665,6 +666,24 @@ async fn print_voice_events(
                     "voice> stt_final elapsed_ms={elapsed_ms} stt_elapsed_ms={stt_elapsed_ms} transcript_chars={transcript_chars}"
                 );
             }
+            VoiceEvent::SttBreakdown {
+                elapsed_ms,
+                speech_audio_ms,
+                vad_silence_ms,
+                total_silence_ms,
+                audio_duration_ms,
+                deepgram_connect_ms,
+                first_interim_ms,
+                finalize_to_final_ms,
+                final_emitted_ms,
+            } => {
+                println!(
+                    "voice> stt_breakdown elapsed_ms={elapsed_ms} speech_audio_ms={speech_audio_ms} vad_silence_ms={vad_silence_ms} total_silence_ms={total_silence_ms} audio_duration_ms={audio_duration_ms} deepgram_connect_ms={} first_interim_ms={} finalize_to_final_ms={} final_emitted_ms={final_emitted_ms}",
+                    optional_ms(deepgram_connect_ms),
+                    optional_ms(first_interim_ms),
+                    optional_ms(finalize_to_final_ms)
+                );
+            }
             VoiceEvent::LlmFirstToken {
                 elapsed_ms,
                 runtime_elapsed_ms,
@@ -702,6 +721,12 @@ async fn print_voice_events(
     }
 
     latency.snapshot()
+}
+
+fn optional_ms(value: Option<u128>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
 }
 
 fn print_voice_latency_snapshot(snapshot: &VoiceLatencySnapshot) {

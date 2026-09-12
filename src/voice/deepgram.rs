@@ -27,8 +27,8 @@ use tokio_tungstenite::{
 };
 
 use super::{
-    AudioChunk, SpeechToText, SttError, SttResult, TextToSpeech, TranscriptEvent, TtsError,
-    TtsEvent, trace_voice_stt, voice_stt_trace_enabled,
+    AudioChunk, SpeechToText, SttError, SttResult, SttTimingBreakdown, TextToSpeech,
+    TranscriptEvent, TtsError, TtsEvent, trace_voice_stt, voice_stt_trace_enabled,
 };
 
 static ACTIVE_STT_STREAMS: AtomicUsize = AtomicUsize::new(0);
@@ -271,14 +271,13 @@ async fn run_listen_stream(
         .map_err(|err| SttError::Backend(format!("Deepgram WebSocket connect failed: {err}")))?;
     let (mut writer, mut reader) = socket.split();
     let trace = voice_stt_trace_enabled();
+    let connect_ms = started.elapsed().as_millis();
     trace_stt(
         trace,
-        &format!(
-            "deepgram_connected elapsed_ms={}",
-            started.elapsed().as_millis()
-        ),
+        &format!("deepgram_connected elapsed_ms={connect_ms}"),
     );
     let sent_timing = Arc::new(Mutex::new(SentAudioTiming::default()));
+    record_deepgram_connected(&sent_timing, connect_ms);
     let sender_timing = Arc::clone(&sent_timing);
 
     let sender = tokio::spawn(async move {
@@ -289,13 +288,24 @@ async fn run_listen_stream(
             }
 
             let sent_at = Instant::now();
+            let bytes = chunk.bytes;
+            let audio_elapsed_ms = chunk.elapsed_ms;
+            let is_speech = chunk.is_speech;
             writer
-                .send(Message::Binary(chunk.bytes.into()))
+                .send(Message::Binary(bytes.into()))
                 .await
                 .map_err(|err| SttError::Backend(format!("Deepgram audio send failed: {err}")))?;
-            record_sent_audio(&sender_timing, started, sent_at, chunk.elapsed_ms, trace);
+            record_sent_audio(
+                &sender_timing,
+                started,
+                sent_at,
+                audio_elapsed_ms,
+                is_speech,
+                trace,
+            );
         }
 
+        record_audio_input_ended(&sender_timing, started.elapsed().as_millis());
         trace_stt(
             trace,
             &format!(
@@ -303,10 +313,16 @@ async fn run_listen_stream(
                 started.elapsed().as_millis()
             ),
         );
+        let finalize_sent_at = Instant::now();
         writer
             .send(Message::Text(r#"{"type":"Finalize"}"#.into()))
             .await
             .map_err(|err| SttError::Backend(format!("Deepgram finalize send failed: {err}")))?;
+        record_finalize_sent(
+            &sender_timing,
+            started.elapsed().as_millis(),
+            finalize_sent_at,
+        );
         trace_stt(
             trace,
             &format!(
@@ -329,15 +345,17 @@ async fn run_listen_stream(
         {
             Message::Text(text) => {
                 let elapsed_ms = stt_elapsed_ms(&sent_timing, started);
-                if trace {
-                    trace_deepgram_message(&text, elapsed_ms, &mut first_interim_seen);
-                }
+                trace_deepgram_message(
+                    &sent_timing,
+                    &text,
+                    elapsed_ms,
+                    &mut first_interim_seen,
+                    trace,
+                );
 
                 for event in state.ingest(&text, elapsed_ms)? {
-                    trace_transcript_event(trace, &event, "deepgram_message");
-                    if tx.send(Ok(event)).await.is_err() {
-                        return Ok(());
-                    }
+                    send_transcript_event(&tx, &sent_timing, event, trace, "deepgram_message")
+                        .await?;
                 }
             }
             Message::Close(_) => break,
@@ -349,10 +367,7 @@ async fn run_listen_stream(
     await_stt_sender(sender).await?;
 
     if let Some(event) = state.finish(stt_elapsed_ms(&sent_timing, started)) {
-        trace_transcript_event(trace, &event, "stream_finish");
-        if tx.send(Ok(event)).await.is_err() {
-            return Ok(());
-        }
+        send_transcript_event(&tx, &sent_timing, event, trace, "stream_finish").await?;
     }
 
     let _ = tx.send(Ok(TranscriptEvent::Done)).await;
@@ -363,6 +378,14 @@ async fn run_listen_stream(
 struct SentAudioTiming {
     first: Option<SentAudioSample>,
     latest: Option<SentAudioSample>,
+    deepgram_connect_ms: Option<u128>,
+    first_interim_ms: Option<u128>,
+    audio_input_ended_ms: Option<u128>,
+    finalize_sent_at: Option<Instant>,
+    finalize_sent_ms: Option<u128>,
+    speech_audio_ms: u128,
+    total_silence_ms: u128,
+    trailing_silence_ms: u128,
 }
 
 #[derive(Clone, Copy)]
@@ -376,6 +399,7 @@ fn record_sent_audio(
     stream_started_at: Instant,
     sent_at: Instant,
     audio_elapsed_ms: u128,
+    is_speech: Option<bool>,
     trace: bool,
 ) {
     let mut timing = sent_timing
@@ -397,7 +421,59 @@ fn record_sent_audio(
         );
     }
 
+    let previous_audio_elapsed_ms = timing
+        .latest
+        .map(|latest| latest.audio_elapsed_ms)
+        .unwrap_or(0);
+    let chunk_elapsed_ms = audio_elapsed_ms.saturating_sub(previous_audio_elapsed_ms);
+    match is_speech {
+        Some(true) => {
+            timing.speech_audio_ms += chunk_elapsed_ms;
+            timing.trailing_silence_ms = 0;
+        }
+        Some(false) => {
+            timing.total_silence_ms += chunk_elapsed_ms;
+            timing.trailing_silence_ms += chunk_elapsed_ms;
+        }
+        None => {}
+    }
+
     timing.latest = Some(sample);
+}
+
+fn record_deepgram_connected(sent_timing: &Mutex<SentAudioTiming>, connect_ms: u128) {
+    let mut timing = sent_timing
+        .lock()
+        .expect("Deepgram STT sent-audio timing mutex poisoned");
+    timing.deepgram_connect_ms = Some(connect_ms);
+}
+
+fn record_audio_input_ended(sent_timing: &Mutex<SentAudioTiming>, input_ended_ms: u128) {
+    let mut timing = sent_timing
+        .lock()
+        .expect("Deepgram STT sent-audio timing mutex poisoned");
+    timing.audio_input_ended_ms = Some(input_ended_ms);
+}
+
+fn record_finalize_sent(
+    sent_timing: &Mutex<SentAudioTiming>,
+    finalize_sent_ms: u128,
+    finalize_sent_at: Instant,
+) {
+    let mut timing = sent_timing
+        .lock()
+        .expect("Deepgram STT sent-audio timing mutex poisoned");
+    timing.finalize_sent_ms = Some(finalize_sent_ms);
+    timing.finalize_sent_at = Some(finalize_sent_at);
+}
+
+fn record_first_interim(sent_timing: &Mutex<SentAudioTiming>, first_interim_ms: u128) {
+    let mut timing = sent_timing
+        .lock()
+        .expect("Deepgram STT sent-audio timing mutex poisoned");
+    if timing.first_interim_ms.is_none() {
+        timing.first_interim_ms = Some(first_interim_ms);
+    }
 }
 
 fn stt_elapsed_ms(sent_timing: &Mutex<SentAudioTiming>, fallback_started: Instant) -> u128 {
@@ -416,7 +492,13 @@ fn trace_stt(enabled: bool, message: &str) {
     }
 }
 
-fn trace_deepgram_message(data: &str, elapsed_ms: u128, first_interim_seen: &mut bool) {
+fn trace_deepgram_message(
+    sent_timing: &Mutex<SentAudioTiming>,
+    data: &str,
+    elapsed_ms: u128,
+    first_interim_seen: &mut bool,
+    trace: bool,
+) {
     let Ok(message) = serde_json::from_str::<DeepgramListenMessage>(data) else {
         return;
     };
@@ -434,8 +516,9 @@ fn trace_deepgram_message(data: &str, elapsed_ms: u128, first_interim_seen: &mut
     let speech_final = message.speech_final.unwrap_or(false);
     if !is_final && !*first_interim_seen {
         *first_interim_seen = true;
+        record_first_interim(sent_timing, elapsed_ms);
         trace_stt(
-            true,
+            trace,
             &format!(
                 "deepgram_first_interim elapsed_ms={elapsed_ms} transcript_chars={}",
                 transcript.len()
@@ -444,13 +527,80 @@ fn trace_deepgram_message(data: &str, elapsed_ms: u128, first_interim_seen: &mut
     }
     if speech_final {
         trace_stt(
-            true,
+            trace,
             &format!(
                 "deepgram_speech_final elapsed_ms={elapsed_ms} is_final={is_final} transcript_chars={}",
                 transcript.len()
             ),
         );
     }
+}
+
+async fn send_transcript_event(
+    tx: &mpsc::Sender<SttResult<TranscriptEvent>>,
+    sent_timing: &Mutex<SentAudioTiming>,
+    event: TranscriptEvent,
+    trace: bool,
+    source: &str,
+) -> SttResult<()> {
+    if let TranscriptEvent::Final { elapsed_ms, .. } = &event {
+        let breakdown = stt_timing_breakdown(sent_timing, *elapsed_ms);
+        trace_stt(
+            trace,
+            &format!(
+                "stt_breakdown speech_audio_ms={} vad_silence_ms={} total_silence_ms={} audio_duration_ms={} deepgram_connect_ms={} first_interim_ms={} finalize_to_final_ms={} final_emitted_ms={}",
+                breakdown.speech_audio_ms,
+                breakdown.vad_silence_ms,
+                breakdown.total_silence_ms,
+                breakdown.audio_duration_ms,
+                optional_ms(breakdown.deepgram_connect_ms),
+                optional_ms(breakdown.first_interim_ms),
+                optional_ms(breakdown.finalize_to_final_ms),
+                breakdown.final_emitted_ms
+            ),
+        );
+        if tx
+            .send(Ok(TranscriptEvent::Breakdown(breakdown)))
+            .await
+            .is_err()
+        {
+            return Ok(());
+        }
+    }
+
+    trace_transcript_event(trace, &event, source);
+    let _ = tx.send(Ok(event)).await;
+    Ok(())
+}
+
+fn stt_timing_breakdown(
+    sent_timing: &Mutex<SentAudioTiming>,
+    final_emitted_ms: u128,
+) -> SttTimingBreakdown {
+    let timing = sent_timing
+        .lock()
+        .expect("Deepgram STT sent-audio timing mutex poisoned");
+    SttTimingBreakdown {
+        speech_audio_ms: timing.speech_audio_ms,
+        vad_silence_ms: timing.trailing_silence_ms,
+        total_silence_ms: timing.total_silence_ms,
+        audio_duration_ms: timing
+            .latest
+            .map(|latest| latest.audio_elapsed_ms)
+            .unwrap_or(0),
+        deepgram_connect_ms: timing.deepgram_connect_ms,
+        first_interim_ms: timing.first_interim_ms,
+        finalize_to_final_ms: timing
+            .finalize_sent_at
+            .map(|finalize_sent_at| finalize_sent_at.elapsed().as_millis()),
+        final_emitted_ms,
+    }
+}
+
+fn optional_ms(value: Option<u128>) -> String {
+    value
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "n/a".to_string())
 }
 
 fn trace_transcript_event(enabled: bool, event: &TranscriptEvent, source: &str) {

@@ -38,6 +38,8 @@ pub type SttResult<T> = std::result::Result<T, SttError>;
 pub struct AudioChunk {
     pub bytes: Vec<u8>,
     pub elapsed_ms: u128,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_speech: Option<bool>,
 }
 
 impl AudioChunk {
@@ -45,11 +47,17 @@ impl AudioChunk {
         Self {
             bytes: bytes.into(),
             elapsed_ms: 0,
+            is_speech: None,
         }
     }
 
     pub fn with_elapsed_ms(mut self, elapsed_ms: u128) -> Self {
         self.elapsed_ms = elapsed_ms;
+        self
+    }
+
+    pub fn with_speech(mut self, is_speech: bool) -> Self {
+        self.is_speech = Some(is_speech);
         self
     }
 }
@@ -77,8 +85,21 @@ pub enum TtsEvent {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TranscriptEvent {
     Partial { text: String, elapsed_ms: u128 },
+    Breakdown(SttTimingBreakdown),
     Final { text: String, elapsed_ms: u128 },
     Done,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SttTimingBreakdown {
+    pub speech_audio_ms: u128,
+    pub vad_silence_ms: u128,
+    pub total_silence_ms: u128,
+    pub audio_duration_ms: u128,
+    pub deepgram_connect_ms: Option<u128>,
+    pub first_interim_ms: Option<u128>,
+    pub finalize_to_final_ms: Option<u128>,
+    pub final_emitted_ms: u128,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -92,6 +113,17 @@ pub enum VoiceEvent {
         elapsed_ms: u128,
         stt_elapsed_ms: u128,
         transcript_chars: usize,
+    },
+    SttBreakdown {
+        elapsed_ms: u128,
+        speech_audio_ms: u128,
+        vad_silence_ms: u128,
+        total_silence_ms: u128,
+        audio_duration_ms: u128,
+        deepgram_connect_ms: Option<u128>,
+        first_interim_ms: Option<u128>,
+        finalize_to_final_ms: Option<u128>,
+        final_emitted_ms: u128,
     },
     LlmFirstToken {
         elapsed_ms: u128,
@@ -298,6 +330,7 @@ impl VoiceLatencyRecorder {
                 self.record(VoiceLatencyMetric::VoiceTurnRoundTrip, *elapsed_ms);
             }
             VoiceEvent::SttPartial { .. }
+            | VoiceEvent::SttBreakdown { .. }
             | VoiceEvent::VoiceTurnCancelled { .. }
             | VoiceEvent::VoiceTurnInterrupted { .. }
             | VoiceEvent::VoiceTurnFailed { .. } => {}
@@ -595,6 +628,22 @@ where
                                     elapsed_ms: started_at.elapsed().as_millis(),
                                     stt_elapsed_ms: elapsed_ms,
                                     transcript_chars: text.len(),
+                                },
+                            );
+                        }
+                        Some(Ok(TranscriptEvent::Breakdown(breakdown))) => {
+                            emit_voice_event(
+                                &voice_events,
+                                VoiceEvent::SttBreakdown {
+                                    elapsed_ms: started_at.elapsed().as_millis(),
+                                    speech_audio_ms: breakdown.speech_audio_ms,
+                                    vad_silence_ms: breakdown.vad_silence_ms,
+                                    total_silence_ms: breakdown.total_silence_ms,
+                                    audio_duration_ms: breakdown.audio_duration_ms,
+                                    deepgram_connect_ms: breakdown.deepgram_connect_ms,
+                                    first_interim_ms: breakdown.first_interim_ms,
+                                    finalize_to_final_ms: breakdown.finalize_to_final_ms,
+                                    final_emitted_ms: breakdown.final_emitted_ms,
                                 },
                             );
                         }

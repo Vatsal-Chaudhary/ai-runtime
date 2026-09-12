@@ -1,4 +1,4 @@
-A streaming LLM orchestration + tool-calling + real-time voice runtime, built directly against provider APIs in Rust. No LangChain, no Pipecat, no agent framework dependency.
+A streaming LLM orchestration + tool-calling + voice runtime with cancellation-aware turn-taking, built directly against provider APIs in Rust. No LangChain, no Pipecat, no agent framework dependency.
 
 Manual voice provider smoke test: [docs/voice-smoke-test.md](docs/voice-smoke-test.md)
 
@@ -71,7 +71,7 @@ LIVEKIT_INPUT_SAMPLE_RATE=16000
 LIVEKIT_INPUT_CHANNELS=1
 LIVEKIT_INPUT_SPEECH_THRESHOLD=250
 LIVEKIT_INPUT_MIN_SPEECH_MS=120
-LIVEKIT_INPUT_SILENCE_TIMEOUT_MS=700
+LIVEKIT_INPUT_SILENCE_TIMEOUT_MS=400
 LIVEKIT_OUTPUT_SAMPLE_RATE=24000
 LIVEKIT_OUTPUT_CHANNELS=1
 LIVEKIT_OUTPUT_BUFFER_MS=100
@@ -146,24 +146,38 @@ To test manually, join the same `LIVEKIT_ROOM` from another LiveKit participant,
 - `tts_first_audio`: TTS text stream start to first audio event
 - `voice_turn_round_trip`: audio stream start to completed voice turn
 
+`voice_turn_round_trip` includes the time for the assistant to finish speaking its full response, so it scales with generated answer length rather than representing fixed processing delay.
+
 Manual LiveKit + Deepgram smoke run:
 
 | Metric | Samples | p50 | p95 |
 |---|---:|---:|---:|
-| STT finalization | 5 | 3454 ms | 4087 ms |
-| LLM first token | 5 | 542 ms | 909 ms |
-| TTS first audio | 5 | 1033 ms | 1440 ms |
-| Voice round trip | 5 | 10179 ms | 11469 ms |
+| STT finalization | 5 | 3078 ms | 3559 ms |
+| LLM first token | 5 | 457 ms | 612 ms |
+| TTS first audio | 5 | 1023 ms | 1172 ms |
+| Voice round trip | 5 | 10383 ms | 15975 ms |
+
+STT component breakdown from the same run:
+
+| Component | p50 | p95 | Notes |
+|---|---:|---:|---|
+| Speech audio | 1750 ms | 2260 ms | VAD-classified speech duration in the user turn |
+| Trailing VAD silence | 400 ms | 400 ms | Local LiveKit silence wait before closing the turn |
+| Total silence in turn | 810 ms | 1060 ms | Includes pauses plus trailing silence |
+| Audio duration | 2750 ms | 3180 ms | Speech plus total silence sent to STT |
+| Deepgram connect | 1369 ms | 1485 ms | Per-turn WebSocket connection setup |
+| First interim transcript | 2231 ms | 2343 ms | Audio-turn start to first interim transcript |
+| Finalize to final transcript | 379 ms | 513 ms | Delay after explicit Deepgram finalize |
 
 Raw turn data from the same run:
 
 | Turn | Prompt | STT final | LLM first token | TTS first audio | Round trip |
 |---:|---|---:|---:|---:|---:|
-| 1 | hello in one sentence | 2696 ms | 909 ms | 1440 ms | 5899 ms |
-| 2 | what is rust in one sentence | 3338 ms | 542 ms | 1033 ms | 10632 ms |
-| 3 | explain async programming in one sentence | 3541 ms | 474 ms | 1019 ms | 10179 ms |
-| 4 | what is a websocket in one sentence | 4087 ms | 458 ms | 1030 ms | 11469 ms |
-| 5 | give one benefit of rust for backend systems | 3454 ms | 645 ms | 1391 ms | 8846 ms |
+| 1 | hello in one sentence | 2322 ms | 541 ms | 1025 ms | 4129 ms |
+| 2 | what is rust in one sentence | 2973 ms | 455 ms | 1172 ms | 7230 ms |
+| 3 | explain async programming in one sentence | 3241 ms | 612 ms | 1009 ms | 10383 ms |
+| 4 | what is a websocket in one sentence | 3559 ms | 457 ms | 1010 ms | 15975 ms |
+| 5 | give one benefit of rust for backend systems | 3078 ms | 388 ms | 1023 ms | 13416 ms |
 
 ## Failure Modes Covered
 
