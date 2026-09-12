@@ -221,6 +221,9 @@ async fn deepgram_tts_smoke(args: Vec<String>) -> Result<(), Box<dyn Error>> {
                     chunk.len()
                 );
             }
+            TtsEvent::PlaybackReset => {
+                println!("deepgram-tts> playback_reset");
+            }
             TtsEvent::Done => {
                 println!("deepgram-tts> done chunks={chunks} bytes={bytes}");
                 break;
@@ -353,6 +356,7 @@ async fn collect_deepgram_tts_audio(
                 println!("deepgram-tts> first_audio elapsed_ms={elapsed_ms}");
             }
             TtsEvent::AudioChunk { bytes, .. } => audio.extend(bytes),
+            TtsEvent::PlaybackReset => {}
             TtsEvent::Done => break,
         }
     }
@@ -628,6 +632,7 @@ async fn print_tts_events(mut events: mpsc::UnboundedReceiver<TtsEvent>) {
                     String::from_utf8_lossy(&bytes)
                 );
             }
+            TtsEvent::PlaybackReset => println!("tts> playback_reset"),
             TtsEvent::Done => println!("tts> done"),
         }
     }

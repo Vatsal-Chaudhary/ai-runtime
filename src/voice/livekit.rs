@@ -5,7 +5,7 @@ use thiserror::Error;
 
 #[cfg(feature = "livekit-transport")]
 use {
-    super::{AudioChunk, TtsEvent, VoiceTransport, VoiceTransportEvent},
+    super::{AudioChunk, TtsEvent, VoiceTransport, VoiceTransportEvent, trace_voice_stt},
     futures_core::stream::BoxStream,
     futures_util::{StreamExt, future::BoxFuture},
     livekit::{
@@ -20,7 +20,7 @@ use {
             prelude::{AudioFrame, AudioSourceOptions, RtcAudioSource},
         },
     },
-    std::{collections::VecDeque, sync::Arc},
+    std::{collections::VecDeque, sync::Arc, time::Instant},
     tokio::{
         sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
         task::JoinHandle,
@@ -386,13 +386,27 @@ async fn remote_audio_turn_task(
 }
 
 #[cfg(feature = "livekit-transport")]
-#[derive(Default)]
 struct ActiveLiveKitAudioTurn {
     tx: Option<UnboundedSender<AudioChunk>>,
     pending: VecDeque<PendingLiveKitFrame>,
     pending_speech_ms: u128,
     elapsed_ms: u128,
     silence_ms: u128,
+    first_speech_started_at: Option<Instant>,
+}
+
+#[cfg(feature = "livekit-transport")]
+impl Default for ActiveLiveKitAudioTurn {
+    fn default() -> Self {
+        Self {
+            tx: None,
+            pending: VecDeque::new(),
+            pending_speech_ms: 0,
+            elapsed_ms: 0,
+            silence_ms: 0,
+            first_speech_started_at: None,
+        }
+    }
 }
 
 #[cfg(feature = "livekit-transport")]
@@ -420,9 +434,15 @@ impl ActiveLiveKitAudioTurn {
             if !speech {
                 self.pending.clear();
                 self.pending_speech_ms = 0;
+                self.first_speech_started_at = None;
                 return None;
             }
 
+            if self.first_speech_started_at.is_none() {
+                self.first_speech_started_at = Some(Instant::now());
+                trace_livekit_stt("livekit_speech_started");
+                let _ = input_tx.send(VoiceTransportEvent::SpeechStarted);
+            }
             self.pending_speech_ms += frame_ms;
             self.pending.push_back(pending_frame);
             if self.pending_speech_ms < config.input_min_speech_duration.as_millis() {
@@ -439,6 +459,14 @@ impl ActiveLiveKitAudioTurn {
             self.tx = Some(turn_tx);
             self.elapsed_ms = 0;
             self.silence_ms = 0;
+            trace_livekit_stt(&format!(
+                "livekit_audio_turn_opened since_first_speech_ms={} pending_audio_ms={} min_speech_ms={}",
+                self.first_speech_started_at
+                    .map(|started_at| started_at.elapsed().as_millis())
+                    .unwrap_or(0),
+                self.pending_speech_ms,
+                config.input_min_speech_duration.as_millis()
+            ));
 
             let chunks = self.drain_pending_chunks();
             return Some((chunks, false));
@@ -457,6 +485,14 @@ impl ActiveLiveKitAudioTurn {
         };
         let close_after_send =
             !speech && self.silence_ms >= config.input_silence_timeout.as_millis();
+        if close_after_send {
+            trace_livekit_stt(&format!(
+                "livekit_audio_turn_closing elapsed_audio_ms={} silence_ms={} silence_timeout_ms={}",
+                self.elapsed_ms,
+                self.silence_ms,
+                config.input_silence_timeout.as_millis()
+            ));
+        }
 
         Some((vec![chunk], close_after_send))
     }
@@ -489,7 +525,13 @@ impl ActiveLiveKitAudioTurn {
         self.pending_speech_ms = 0;
         self.elapsed_ms = 0;
         self.silence_ms = 0;
+        self.first_speech_started_at = None;
     }
+}
+
+#[cfg(feature = "livekit-transport")]
+fn trace_livekit_stt(message: &str) {
+    trace_voice_stt(message);
 }
 
 #[cfg(feature = "livekit-transport")]
@@ -506,8 +548,9 @@ async fn tts_playback_task(
     config: LiveKitConfig,
 ) {
     let mut pending_byte = None;
+    let mut queued_events = VecDeque::new();
 
-    while let Some(event) = tts_rx.recv().await {
+    while let Some(event) = next_playback_event(&mut tts_rx, &mut queued_events).await {
         match event {
             TtsEvent::FirstAudio { .. } => {}
             TtsEvent::AudioChunk { bytes, .. } => {
@@ -523,6 +566,11 @@ async fn tts_playback_task(
                     config.output_frame_ms,
                 );
                 for frame_samples in samples.chunks(frame_samples) {
+                    if drain_playback_reset(&mut tts_rx, &mut queued_events) {
+                        pending_byte = None;
+                        break;
+                    }
+
                     let frame = AudioFrame {
                         data: frame_samples.into(),
                         sample_rate: config.output_sample_rate,
@@ -536,11 +584,49 @@ async fn tts_playback_task(
                     }
                 }
             }
+            TtsEvent::PlaybackReset => {
+                pending_byte = None;
+            }
             TtsEvent::Done => {
                 pending_byte = None;
             }
         }
     }
+}
+
+#[cfg(feature = "livekit-transport")]
+async fn next_playback_event(
+    tts_rx: &mut UnboundedReceiver<TtsEvent>,
+    queued_events: &mut VecDeque<TtsEvent>,
+) -> Option<TtsEvent> {
+    if let Some(event) = queued_events.pop_front() {
+        Some(event)
+    } else {
+        tts_rx.recv().await
+    }
+}
+
+#[cfg(feature = "livekit-transport")]
+fn drain_playback_reset(
+    tts_rx: &mut UnboundedReceiver<TtsEvent>,
+    queued_events: &mut VecDeque<TtsEvent>,
+) -> bool {
+    let mut drained = Vec::new();
+    while let Ok(event) = tts_rx.try_recv() {
+        drained.push(event);
+    }
+
+    if let Some(reset_index) = drained
+        .iter()
+        .rposition(|event| matches!(event, TtsEvent::PlaybackReset))
+    {
+        queued_events.clear();
+        queued_events.extend(drained.drain(reset_index + 1..));
+        return true;
+    }
+
+    queued_events.extend(drained);
+    false
 }
 
 fn required_env(name: &'static str) -> Result<String, LiveKitConfigError> {
@@ -729,6 +815,38 @@ mod tests {
 
     #[cfg(feature = "livekit-transport")]
     #[test]
+    fn playback_reset_drops_queued_audio_before_reset() {
+        let (tx, mut rx) = unbounded_channel();
+        let mut queued = VecDeque::from([TtsEvent::AudioChunk {
+            bytes: b"oldest".to_vec(),
+            elapsed_ms: 0,
+        }]);
+        tx.send(TtsEvent::AudioChunk {
+            bytes: b"old".to_vec(),
+            elapsed_ms: 1,
+        })
+        .expect("old audio should queue");
+        tx.send(TtsEvent::PlaybackReset)
+            .expect("reset should queue");
+        tx.send(TtsEvent::AudioChunk {
+            bytes: b"new".to_vec(),
+            elapsed_ms: 2,
+        })
+        .expect("new audio should queue");
+
+        assert!(drain_playback_reset(&mut rx, &mut queued));
+
+        assert_eq!(
+            queued,
+            VecDeque::from([TtsEvent::AudioChunk {
+                bytes: b"new".to_vec(),
+                elapsed_ms: 2,
+            }])
+        );
+    }
+
+    #[cfg(feature = "livekit-transport")]
+    #[test]
     fn active_turn_waits_for_minimum_speech_before_opening_stream() {
         let config = LiveKitConfig::new("wss://example.livekit.cloud", "devkey", "secret")
             .with_input_vad(250, Duration::from_millis(30), Duration::from_millis(700));
@@ -745,7 +863,10 @@ mod tests {
             turn.push_frame(first, 10, true, &config, &input_tx)
                 .is_none()
         );
-        assert!(input_rx.try_recv().is_err());
+        assert!(matches!(
+            input_rx.try_recv(),
+            Ok(VoiceTransportEvent::SpeechStarted)
+        ));
 
         let second = AudioFrame {
             data: [600i16].as_slice().into(),

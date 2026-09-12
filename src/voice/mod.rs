@@ -2,7 +2,7 @@ use std::{
     collections::VecDeque,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, OnceLock,
         atomic::{AtomicUsize, Ordering},
     },
     task::{Context, Poll},
@@ -70,6 +70,7 @@ pub enum TtsError {
 pub enum TtsEvent {
     FirstAudio { elapsed_ms: u128 },
     AudioChunk { bytes: Vec<u8>, elapsed_ms: u128 },
+    PlaybackReset,
     Done,
 }
 
@@ -170,6 +171,7 @@ pub enum VoiceSessionError {
 }
 
 pub enum VoiceTransportEvent {
+    SpeechStarted,
     AudioTurn(BoxStream<'static, AudioChunk>),
     Closed,
 }
@@ -353,6 +355,7 @@ pub struct VoiceSession<P, S, T> {
 
 struct ActiveVoiceTurn {
     cancellation_token: CancellationToken,
+    tts_events: UnboundedSender<TtsEvent>,
     started_at: Instant,
     task: JoinHandle<std::result::Result<VoiceTurnOutput, VoiceTurnError>>,
 }
@@ -411,7 +414,7 @@ where
         let context = Arc::clone(&self.context);
         let cancellation_token = CancellationToken::new();
         let options = VoiceTurnOptions::new(cancellation_token.clone())
-            .with_tts_events(tts_events)
+            .with_tts_events(tts_events.clone())
             .with_optional_voice_events(self.voice_events.clone());
         let task = tokio::spawn(async move {
             let mut context = context.lock().await;
@@ -422,6 +425,7 @@ where
 
         self.active_turn = Some(ActiveVoiceTurn {
             cancellation_token,
+            tts_events,
             started_at: Instant::now(),
             task,
         });
@@ -446,11 +450,18 @@ where
         let was_running = !active_turn.task.is_finished();
         if was_running {
             active_turn.cancellation_token.cancel();
+            reset_playback(&active_turn.tts_events);
         }
 
-        match active_turn.task.await? {
+        let result = active_turn.task.await?;
+        if was_running {
+            reset_playback(&active_turn.tts_events);
+        }
+
+        match result {
             Ok(_) => Ok(()),
             Err(VoiceTurnError::Cancelled) if was_running => Ok(()),
+            Err(VoiceTurnError::MissingFinalTranscript) => Ok(()),
             Err(err) => Err(VoiceSessionError::VoiceTurn(err)),
         }
     }
@@ -464,6 +475,9 @@ where
     {
         loop {
             match transport.next_event().await {
+                Some(VoiceTransportEvent::SpeechStarted) => {
+                    self.interrupt_active_transport_turn().await?;
+                }
                 Some(VoiceTransportEvent::AudioTurn(audio)) => {
                     self.interrupt_active_transport_turn().await?;
                     self.spawn_audio_turn(audio, transport.tts_events());
@@ -494,9 +508,15 @@ where
                 },
             );
             active_turn.cancellation_token.cancel();
+            reset_playback(&active_turn.tts_events);
         }
 
-        match active_turn.task.await? {
+        let result = active_turn.task.await?;
+        if was_running {
+            reset_playback(&active_turn.tts_events);
+        }
+
+        match result {
             Ok(_) => Ok(()),
             Err(VoiceTurnError::Cancelled) if was_running => Ok(()),
             Err(err) => Err(VoiceSessionError::VoiceTurn(err)),
@@ -746,6 +766,29 @@ fn emit_voice_event(events: &Option<UnboundedSender<VoiceEvent>>, event: VoiceEv
     }
 }
 
+fn reset_playback(tts_events: &UnboundedSender<TtsEvent>) {
+    let _ = tts_events.send(TtsEvent::PlaybackReset);
+}
+
+pub(crate) fn voice_stt_trace_enabled() -> bool {
+    std::env::var("AI_RUNTIME_STT_TRACE")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+}
+
+pub(crate) fn trace_voice_stt(message: &str) {
+    if !voice_stt_trace_enabled() {
+        return;
+    }
+
+    static TRACE_STARTED_AT: OnceLock<Instant> = OnceLock::new();
+    let started_at = TRACE_STARTED_AT.get_or_init(Instant::now);
+    println!(
+        "voice-trace> trace_elapsed_ms={} {message}",
+        started_at.elapsed().as_millis()
+    );
+}
+
 #[derive(Debug, Clone)]
 pub struct RuntimeTtsAdapter<T> {
     tts: T,
@@ -809,7 +852,10 @@ where
                         }
                         Some(RuntimeEvent::AssistantToken { text, .. }) => {
                             if let Some(sender) = &text_tx {
-                                let _ = sender.send(text);
+                                let text = sanitize_tts_fragment(&text);
+                                if !text.is_empty() {
+                                    let _ = sender.send(text);
+                                }
                             }
                         }
                         Some(RuntimeEvent::Lifecycle { to, .. }) if to.is_terminal() => {
@@ -860,6 +906,12 @@ async fn recv_runtime_event(
     }
 }
 
+fn sanitize_tts_fragment(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !matches!(ch, '*' | '`' | '#'))
+        .collect()
+}
+
 fn receiver_stream<T: Send + 'static>(rx: UnboundedReceiver<T>) -> BoxStream<'static, T> {
     Box::pin(futures_util::stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|item| (item, rx))
@@ -902,6 +954,14 @@ impl VoiceTransport for FakeVoiceTransport {
 }
 
 impl FakeVoiceTransportHandle {
+    pub fn send_speech_started(&self) -> std::result::Result<(), VoiceTransportError> {
+        self.input_tx
+            .as_ref()
+            .ok_or(VoiceTransportError::Closed)?
+            .send(VoiceTransportEvent::SpeechStarted)
+            .map_err(|_| VoiceTransportError::Closed)
+    }
+
     pub fn send_audio_turn(
         &self,
         chunks: Vec<AudioChunk>,
@@ -1594,6 +1654,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fake_transport_speech_started_cancels_active_turn_before_audio_turn() {
+        let provider = TokenThenHangingProvider {
+            token: "partial".to_string(),
+        };
+        let tts = FakeTextToSpeech::new();
+        let tts_probe = tts.clone();
+        let (voice_tx, mut voice_rx) = mpsc::unbounded_channel();
+        let mut session = VoiceSession::new(
+            provider,
+            ToolRegistry::new(),
+            RuntimeConfig::new("test"),
+            FakeSpeechToText::new(),
+            tts,
+            ConversationContext::new(),
+        )
+        .with_voice_events(voice_tx);
+        let (transport, mut handle) = FakeVoiceTransport::new();
+
+        let result = {
+            let run = session.run_transport(transport);
+            tokio::pin!(run);
+
+            handle
+                .send_audio_turn(vec![AudioChunk::new("first request").with_elapsed_ms(1)])
+                .expect("first input should send");
+            let first_chunk = tokio::select! {
+                chunk = next_transport_audio_chunk(&mut handle) => chunk,
+                result = &mut run => panic!("transport runner finished before first playback: {result:?}"),
+            };
+            assert_eq!(first_chunk, b"fake-tts:0:partial".to_vec());
+
+            handle
+                .send_speech_started()
+                .expect("speech start should send");
+            handle.close().expect("transport should close gracefully");
+
+            timeout(Duration::from_secs(1), &mut run)
+                .await
+                .expect("transport runner should finish")
+        };
+
+        result.expect("speech start should cancel active turn without surfacing an error");
+        assert_eq!(tts_probe.active_stream_count(), 0);
+
+        let context = session.context_snapshot().await;
+        assert!(
+            context
+                .messages()
+                .iter()
+                .all(|message| message.content != "partial"),
+            "interrupted assistant text should not be committed: {:#?}",
+            context.messages()
+        );
+
+        let voice_events = drain_voice_events(&mut voice_rx);
+        assert!(
+            voice_events
+                .iter()
+                .any(|event| matches!(event, VoiceEvent::VoiceTurnInterrupted { .. })),
+            "early speech start should emit interruption: {voice_events:#?}"
+        );
+        assert!(
+            voice_events
+                .iter()
+                .any(|event| matches!(event, VoiceEvent::VoiceTurnCancelled { .. })),
+            "early speech start should cancel active turn: {voice_events:#?}"
+        );
+    }
+
+    #[tokio::test]
     async fn fake_transport_skips_missing_transcript_segment_and_runs_next_turn() {
         let provider = StaticTokenProvider::new(vec!["valid ", "turn"]);
         let mut session = VoiceSession::new(
@@ -1938,6 +2068,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn tts_sanitizer_drops_markdown_formatting_markers() {
+        assert_eq!(
+            sanitize_tts_fragment("***In a nutshell***: `async` lets Rust #tasks run."),
+            "In a nutshell: async lets Rust tasks run."
+        );
+    }
+
     fn audio_chunks(events: &[TtsEvent]) -> Vec<Vec<u8>> {
         events
             .iter()
@@ -1957,6 +2095,7 @@ mod tests {
             {
                 TtsEvent::AudioChunk { bytes, .. } => return bytes,
                 TtsEvent::FirstAudio { .. } => {}
+                TtsEvent::PlaybackReset => {}
                 TtsEvent::Done => panic!("TTS stream completed before audio chunk"),
             }
         }
@@ -1971,6 +2110,7 @@ mod tests {
             {
                 TtsEvent::AudioChunk { bytes, .. } => return bytes,
                 TtsEvent::FirstAudio { .. } => {}
+                TtsEvent::PlaybackReset => {}
                 TtsEvent::Done => panic!("TTS stream completed before audio chunk"),
             }
         }

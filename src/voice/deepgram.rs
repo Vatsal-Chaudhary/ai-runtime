@@ -2,7 +2,7 @@ use std::{
     env,
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     task::{Context, Poll},
@@ -28,7 +28,7 @@ use tokio_tungstenite::{
 
 use super::{
     AudioChunk, SpeechToText, SttError, SttResult, TextToSpeech, TranscriptEvent, TtsError,
-    TtsEvent,
+    TtsEvent, trace_voice_stt, voice_stt_trace_enabled,
 };
 
 static ACTIVE_STT_STREAMS: AtomicUsize = AtomicUsize::new(0);
@@ -36,6 +36,7 @@ static ACTIVE_TTS_STREAMS: AtomicUsize = AtomicUsize::new(0);
 
 const DEFAULT_LISTEN_URL: &str = "wss://api.deepgram.com/v1/listen?model=nova-3&language=en&smart_format=true&interim_results=true&encoding=linear16&sample_rate=16000&channels=1&endpointing=300";
 const DEFAULT_SPEAK_URL: &str = "https://api.deepgram.com/v1/speak?model=aura-2-thalia-en&encoding=linear16&container=none&sample_rate=24000";
+const DEFAULT_TTS_MAX_CHARS: usize = 1_800;
 
 pub fn active_deepgram_stt_stream_count() -> usize {
     ACTIVE_STT_STREAMS.load(Ordering::SeqCst)
@@ -52,6 +53,7 @@ pub struct DeepgramConfig {
     pub speak_url: String,
     pub timeout: Duration,
     pub stream_buffer_capacity: usize,
+    pub tts_max_chars: usize,
 }
 
 impl DeepgramConfig {
@@ -62,6 +64,7 @@ impl DeepgramConfig {
             speak_url: DEFAULT_SPEAK_URL.to_string(),
             timeout: Duration::from_secs(30),
             stream_buffer_capacity: 8,
+            tts_max_chars: DEFAULT_TTS_MAX_CHARS,
         }
     }
 
@@ -76,6 +79,16 @@ impl DeepgramConfig {
 
         if let Ok(speak_url) = env::var("DEEPGRAM_SPEAK_URL") {
             config.speak_url = speak_url;
+        }
+
+        if let Ok(max_chars) = env::var("DEEPGRAM_TTS_MAX_CHARS") {
+            config.tts_max_chars = max_chars
+                .parse::<usize>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| DeepgramConfigError::InvalidTtsMaxChars {
+                    value: max_chars.clone(),
+                })?;
         }
 
         Ok(config)
@@ -96,6 +109,9 @@ impl DeepgramConfig {
 pub enum DeepgramConfigError {
     #[error("DEEPGRAM_API_KEY must be set")]
     MissingApiKey,
+
+    #[error("DEEPGRAM_TTS_MAX_CHARS must be a positive integer, got {value:?}")]
+    InvalidTtsMaxChars { value: String },
 }
 
 #[derive(Clone)]
@@ -254,6 +270,16 @@ async fn run_listen_stream(
         .await
         .map_err(|err| SttError::Backend(format!("Deepgram WebSocket connect failed: {err}")))?;
     let (mut writer, mut reader) = socket.split();
+    let trace = voice_stt_trace_enabled();
+    trace_stt(
+        trace,
+        &format!(
+            "deepgram_connected elapsed_ms={}",
+            started.elapsed().as_millis()
+        ),
+    );
+    let sent_timing = Arc::new(Mutex::new(SentAudioTiming::default()));
+    let sender_timing = Arc::clone(&sent_timing);
 
     let sender = tokio::spawn(async move {
         let mut audio = audio;
@@ -262,16 +288,32 @@ async fn run_listen_stream(
                 continue;
             }
 
+            let sent_at = Instant::now();
             writer
                 .send(Message::Binary(chunk.bytes.into()))
                 .await
                 .map_err(|err| SttError::Backend(format!("Deepgram audio send failed: {err}")))?;
+            record_sent_audio(&sender_timing, started, sent_at, chunk.elapsed_ms, trace);
         }
 
+        trace_stt(
+            trace,
+            &format!(
+                "deepgram_audio_input_ended elapsed_ms={}",
+                started.elapsed().as_millis()
+            ),
+        );
         writer
             .send(Message::Text(r#"{"type":"Finalize"}"#.into()))
             .await
             .map_err(|err| SttError::Backend(format!("Deepgram finalize send failed: {err}")))?;
+        trace_stt(
+            trace,
+            &format!(
+                "deepgram_finalize_sent elapsed_ms={}",
+                started.elapsed().as_millis()
+            ),
+        );
         writer
             .send(Message::Text(r#"{"type":"CloseStream"}"#.into()))
             .await
@@ -280,12 +322,19 @@ async fn run_listen_stream(
     });
 
     let mut state = DeepgramTranscriptState::default();
+    let mut first_interim_seen = false;
     while let Some(message) = reader.next().await {
         match message
             .map_err(|err| SttError::Backend(format!("Deepgram WebSocket read failed: {err}")))?
         {
             Message::Text(text) => {
-                for event in state.ingest(&text, started.elapsed().as_millis())? {
+                let elapsed_ms = stt_elapsed_ms(&sent_timing, started);
+                if trace {
+                    trace_deepgram_message(&text, elapsed_ms, &mut first_interim_seen);
+                }
+
+                for event in state.ingest(&text, elapsed_ms)? {
+                    trace_transcript_event(trace, &event, "deepgram_message");
                     if tx.send(Ok(event)).await.is_err() {
                         return Ok(());
                     }
@@ -299,7 +348,8 @@ async fn run_listen_stream(
 
     await_stt_sender(sender).await?;
 
-    if let Some(event) = state.finish(started.elapsed().as_millis()) {
+    if let Some(event) = state.finish(stt_elapsed_ms(&sent_timing, started)) {
+        trace_transcript_event(trace, &event, "stream_finish");
         if tx.send(Ok(event)).await.is_err() {
             return Ok(());
         }
@@ -307,6 +357,115 @@ async fn run_listen_stream(
 
     let _ = tx.send(Ok(TranscriptEvent::Done)).await;
     Ok(())
+}
+
+#[derive(Default)]
+struct SentAudioTiming {
+    first: Option<SentAudioSample>,
+    latest: Option<SentAudioSample>,
+}
+
+#[derive(Clone, Copy)]
+struct SentAudioSample {
+    sent_at: Instant,
+    audio_elapsed_ms: u128,
+}
+
+fn record_sent_audio(
+    sent_timing: &Mutex<SentAudioTiming>,
+    stream_started_at: Instant,
+    sent_at: Instant,
+    audio_elapsed_ms: u128,
+    trace: bool,
+) {
+    let mut timing = sent_timing
+        .lock()
+        .expect("Deepgram STT sent-audio timing mutex poisoned");
+    let sample = SentAudioSample {
+        sent_at,
+        audio_elapsed_ms,
+    };
+
+    if timing.first.is_none() {
+        timing.first = Some(sample);
+        trace_stt(
+            trace,
+            &format!(
+                "deepgram_first_audio_sent stream_elapsed_ms={} audio_elapsed_ms={audio_elapsed_ms}",
+                stream_started_at.elapsed().as_millis()
+            ),
+        );
+    }
+
+    timing.latest = Some(sample);
+}
+
+fn stt_elapsed_ms(sent_timing: &Mutex<SentAudioTiming>, fallback_started: Instant) -> u128 {
+    let timing = sent_timing
+        .lock()
+        .expect("Deepgram STT sent-audio timing mutex poisoned");
+    match timing.latest {
+        Some(sample) => sample.audio_elapsed_ms + sample.sent_at.elapsed().as_millis(),
+        None => fallback_started.elapsed().as_millis(),
+    }
+}
+
+fn trace_stt(enabled: bool, message: &str) {
+    if enabled {
+        trace_voice_stt(message);
+    }
+}
+
+fn trace_deepgram_message(data: &str, elapsed_ms: u128, first_interim_seen: &mut bool) {
+    let Ok(message) = serde_json::from_str::<DeepgramListenMessage>(data) else {
+        return;
+    };
+    if !message.is_results() {
+        return;
+    }
+    let Some(transcript) = message.transcript() else {
+        return;
+    };
+    if transcript.is_empty() {
+        return;
+    }
+
+    let is_final = message.is_final.unwrap_or(false);
+    let speech_final = message.speech_final.unwrap_or(false);
+    if !is_final && !*first_interim_seen {
+        *first_interim_seen = true;
+        trace_stt(
+            true,
+            &format!(
+                "deepgram_first_interim elapsed_ms={elapsed_ms} transcript_chars={}",
+                transcript.len()
+            ),
+        );
+    }
+    if speech_final {
+        trace_stt(
+            true,
+            &format!(
+                "deepgram_speech_final elapsed_ms={elapsed_ms} is_final={is_final} transcript_chars={}",
+                transcript.len()
+            ),
+        );
+    }
+}
+
+fn trace_transcript_event(enabled: bool, event: &TranscriptEvent, source: &str) {
+    if !enabled {
+        return;
+    }
+    if let TranscriptEvent::Final { text, elapsed_ms } = event {
+        trace_stt(
+            true,
+            &format!(
+                "stt_final_emitted elapsed_ms={elapsed_ms} source={source} transcript_chars={}",
+                text.len()
+            ),
+        );
+    }
 }
 
 fn listen_request(
@@ -471,6 +630,7 @@ async fn run_speak_stream(
         let _ = tx.send(Ok(TtsEvent::Done)).await;
         return Ok(());
     }
+    input = truncate_tts_input(input, config.tts_max_chars);
 
     let started = Instant::now();
     let response = client
@@ -540,6 +700,19 @@ fn deepgram_tts_status_error(status: StatusCode, body: String) -> TtsError {
 #[derive(Debug, Serialize)]
 struct DeepgramSpeakRequest {
     text: String,
+}
+
+fn truncate_tts_input(input: String, max_chars: usize) -> String {
+    if input.chars().count() <= max_chars {
+        return input;
+    }
+
+    let kept = max_chars.saturating_sub(3);
+    let mut output = input.chars().take(kept).collect::<String>();
+    if max_chars >= 3 {
+        output.push_str("...");
+    }
+    output
 }
 
 #[cfg(test)]
@@ -616,6 +789,13 @@ mod tests {
                 elapsed_ms: 20,
             }]
         );
+    }
+
+    #[test]
+    fn tts_input_truncates_to_max_chars() {
+        let input = "abcdef".to_string();
+
+        assert_eq!(truncate_tts_input(input, 5), "ab...");
     }
 
     #[test]

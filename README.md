@@ -150,21 +150,20 @@ Manual LiveKit + Deepgram smoke run:
 
 | Metric | Samples | p50 | p95 |
 |---|---:|---:|---:|
-| STT finalization | 6 | 3440 ms | 4672 ms |
-| LLM first token | 6 | 547 ms | 604 ms |
-| TTS first audio | 6 | 1026 ms | 1526 ms |
-| Voice round trip | 6 | 7968 ms | 10321 ms |
+| STT finalization | 5 | 3454 ms | 4087 ms |
+| LLM first token | 5 | 542 ms | 909 ms |
+| TTS first audio | 5 | 1033 ms | 1440 ms |
+| Voice round trip | 5 | 10179 ms | 11469 ms |
 
 Raw turn data from the same run:
 
 | Turn | Prompt | STT final | LLM first token | TTS first audio | Round trip |
 |---:|---|---:|---:|---:|---:|
-| 1 | say hello in one sentence | 3440 ms | 599 ms | 1026 ms | 5430 ms |
-| 2 | what is rust in one sentence | 3544 ms | 547 ms | 1526 ms | 7968 ms |
-| 3 | give me one benefit of async programming | 3387 ms | 567 ms | 1179 ms | 10154 ms |
-| 4 | what is a websocket in one sentence | 4012 ms | 525 ms | 963 ms | 9515 ms |
-| 5 | tell me one advantage of using rust for backend systems | 4672 ms | 346 ms | 1006 ms | 10321 ms |
-| 6 | say hello in one sentence | 2455 ms | 604 ms | 1111 ms | 4510 ms |
+| 1 | hello in one sentence | 2696 ms | 909 ms | 1440 ms | 5899 ms |
+| 2 | what is rust in one sentence | 3338 ms | 542 ms | 1033 ms | 10632 ms |
+| 3 | explain async programming in one sentence | 3541 ms | 474 ms | 1019 ms | 10179 ms |
+| 4 | what is a websocket in one sentence | 4087 ms | 458 ms | 1030 ms | 11469 ms |
+| 5 | give one benefit of rust for backend systems | 3454 ms | 645 ms | 1391 ms | 8846 ms |
 
 ## Failure Modes Covered
 
