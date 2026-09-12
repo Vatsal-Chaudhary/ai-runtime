@@ -33,6 +33,8 @@ const DEFAULT_IDENTITY: &str = "ai-runtime-agent";
 const DEFAULT_NAME: &str = "ai-runtime agent";
 const DEFAULT_INPUT_SAMPLE_RATE: u32 = 16_000;
 const DEFAULT_INPUT_CHANNELS: u32 = 1;
+const DEFAULT_INPUT_SPEECH_THRESHOLD: u32 = 250;
+const DEFAULT_INPUT_SILENCE_TIMEOUT_MS: u64 = 700;
 const DEFAULT_OUTPUT_SAMPLE_RATE: u32 = 24_000;
 const DEFAULT_OUTPUT_CHANNELS: u32 = 1;
 const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
@@ -47,6 +49,8 @@ pub struct LiveKitConfig {
     pub name: String,
     pub input_sample_rate: u32,
     pub input_channels: u32,
+    pub input_speech_threshold: u32,
+    pub input_silence_timeout: Duration,
     pub output_sample_rate: u32,
     pub output_channels: u32,
     pub token_ttl: Duration,
@@ -67,6 +71,8 @@ impl LiveKitConfig {
             name: DEFAULT_NAME.to_string(),
             input_sample_rate: DEFAULT_INPUT_SAMPLE_RATE,
             input_channels: DEFAULT_INPUT_CHANNELS,
+            input_speech_threshold: DEFAULT_INPUT_SPEECH_THRESHOLD,
+            input_silence_timeout: Duration::from_millis(DEFAULT_INPUT_SILENCE_TIMEOUT_MS),
             output_sample_rate: DEFAULT_OUTPUT_SAMPLE_RATE,
             output_channels: DEFAULT_OUTPUT_CHANNELS,
             token_ttl: DEFAULT_TOKEN_TTL,
@@ -88,6 +94,12 @@ impl LiveKitConfig {
             optional_u32_env("LIVEKIT_INPUT_SAMPLE_RATE")?.unwrap_or(DEFAULT_INPUT_SAMPLE_RATE);
         config.input_channels =
             optional_u32_env("LIVEKIT_INPUT_CHANNELS")?.unwrap_or(DEFAULT_INPUT_CHANNELS);
+        config.input_speech_threshold = optional_u32_env("LIVEKIT_INPUT_SPEECH_THRESHOLD")?
+            .unwrap_or(DEFAULT_INPUT_SPEECH_THRESHOLD);
+        config.input_silence_timeout = Duration::from_millis(
+            optional_u64_env("LIVEKIT_INPUT_SILENCE_TIMEOUT_MS")?
+                .unwrap_or(DEFAULT_INPUT_SILENCE_TIMEOUT_MS),
+        );
         config.output_sample_rate =
             optional_u32_env("LIVEKIT_OUTPUT_SAMPLE_RATE")?.unwrap_or(DEFAULT_OUTPUT_SAMPLE_RATE);
         config.output_channels =
@@ -114,6 +126,12 @@ impl LiveKitConfig {
     pub fn with_input_audio(mut self, sample_rate: u32, channels: u32) -> Self {
         self.input_sample_rate = sample_rate;
         self.input_channels = channels;
+        self
+    }
+
+    pub fn with_input_vad(mut self, speech_threshold: u32, silence_timeout: Duration) -> Self {
+        self.input_speech_threshold = speech_threshold;
+        self.input_silence_timeout = silence_timeout;
         self
     }
 
@@ -152,6 +170,9 @@ pub enum LiveKitConfigError {
 
     #[error("{name} must be a positive integer, got {value:?}")]
     InvalidU32 { name: &'static str, value: String },
+
+    #[error("{name} must be a positive integer, got {value:?}")]
+    InvalidU64 { name: &'static str, value: String },
 
     #[error("LiveKit token generation failed: {0}")]
     Token(String),
@@ -285,14 +306,11 @@ async fn room_event_task(
                 track: RemoteTrack::Audio(track),
                 ..
             } => {
-                let audio =
-                    remote_audio_chunks(track, config.input_sample_rate, config.input_channels);
-                if input_tx
-                    .send(VoiceTransportEvent::AudioTurn(audio))
-                    .is_err()
-                {
-                    break;
-                }
+                tokio::spawn(remote_audio_turn_task(
+                    track,
+                    input_tx.clone(),
+                    config.clone(),
+                ));
             }
             RoomEvent::Disconnected { reason } => {
                 warn!("LiveKit room disconnected: {reason:?}");
@@ -305,22 +323,109 @@ async fn room_event_task(
 }
 
 #[cfg(feature = "livekit-transport")]
-fn remote_audio_chunks(
+async fn remote_audio_turn_task(
     track: RemoteAudioTrack,
-    sample_rate: u32,
-    channels: u32,
-) -> BoxStream<'static, AudioChunk> {
-    let stream = NativeAudioStream::new(track.rtc_track(), sample_rate as i32, channels as i32);
-    Box::pin(futures_util::stream::unfold(
-        (stream, 0u128),
-        |(mut stream, elapsed_ms)| async move {
-            let frame = stream.next().await?;
-            let frame_ms = audio_frame_elapsed_ms(frame.sample_rate, frame.samples_per_channel);
-            let elapsed_ms = elapsed_ms + frame_ms;
-            let bytes = linear16_samples_to_bytes(frame.data.as_ref());
-            Some((AudioChunk { bytes, elapsed_ms }, (stream, elapsed_ms)))
-        },
-    ))
+    input_tx: UnboundedSender<VoiceTransportEvent>,
+    config: LiveKitConfig,
+) {
+    let mut stream = NativeAudioStream::new(
+        track.rtc_track(),
+        config.input_sample_rate as i32,
+        config.input_channels as i32,
+    );
+    let mut active_turn = ActiveLiveKitAudioTurn::default();
+
+    while let Some(frame) = stream.next().await {
+        let frame_ms = audio_frame_elapsed_ms(frame.sample_rate, frame.samples_per_channel);
+        let speech = frame_has_speech(frame.data.as_ref(), config.input_speech_threshold);
+        let Some((chunk, close_after_send)) =
+            active_turn.push_frame(frame, frame_ms, speech, &config, &input_tx)
+        else {
+            continue;
+        };
+
+        if active_turn.send_chunk(chunk).is_err() {
+            active_turn.close();
+            continue;
+        }
+
+        if close_after_send {
+            active_turn.close();
+        }
+    }
+}
+
+#[cfg(feature = "livekit-transport")]
+#[derive(Default)]
+struct ActiveLiveKitAudioTurn {
+    tx: Option<UnboundedSender<AudioChunk>>,
+    elapsed_ms: u128,
+    silence_ms: u128,
+}
+
+#[cfg(feature = "livekit-transport")]
+impl ActiveLiveKitAudioTurn {
+    fn push_frame(
+        &mut self,
+        frame: AudioFrame<'static>,
+        frame_ms: u128,
+        speech: bool,
+        config: &LiveKitConfig,
+        input_tx: &UnboundedSender<VoiceTransportEvent>,
+    ) -> Option<(AudioChunk, bool)> {
+        if self.tx.is_none() {
+            if !speech {
+                return None;
+            }
+
+            let (turn_tx, turn_rx) = unbounded_channel();
+            if input_tx
+                .send(VoiceTransportEvent::AudioTurn(audio_turn_stream(turn_rx)))
+                .is_err()
+            {
+                return None;
+            }
+            self.tx = Some(turn_tx);
+            self.elapsed_ms = 0;
+            self.silence_ms = 0;
+        }
+
+        self.elapsed_ms += frame_ms;
+        if speech {
+            self.silence_ms = 0;
+        } else {
+            self.silence_ms += frame_ms;
+        }
+
+        let chunk = AudioChunk {
+            bytes: linear16_samples_to_bytes(frame.data.as_ref()),
+            elapsed_ms: self.elapsed_ms,
+        };
+        let close_after_send =
+            !speech && self.silence_ms >= config.input_silence_timeout.as_millis();
+
+        Some((chunk, close_after_send))
+    }
+
+    fn send_chunk(&self, chunk: AudioChunk) -> std::result::Result<(), AudioChunk> {
+        match &self.tx {
+            Some(tx) => tx.send(chunk).map_err(|err| err.0),
+            None => Err(chunk),
+        }
+    }
+
+    fn close(&mut self) {
+        self.tx = None;
+        self.elapsed_ms = 0;
+        self.silence_ms = 0;
+    }
+}
+
+#[cfg(feature = "livekit-transport")]
+fn audio_turn_stream(rx: UnboundedReceiver<AudioChunk>) -> BoxStream<'static, AudioChunk> {
+    Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|chunk| (chunk, rx))
+    }))
 }
 
 #[cfg(feature = "livekit-transport")]
@@ -381,6 +486,19 @@ fn optional_u32_env(name: &'static str) -> Result<Option<u32>, LiveKitConfigErro
         .ok_or(LiveKitConfigError::InvalidU32 { name, value })
 }
 
+fn optional_u64_env(name: &'static str) -> Result<Option<u64>, LiveKitConfigError> {
+    let Some(value) = optional_env(name) else {
+        return Ok(None);
+    };
+
+    value
+        .parse::<u64>()
+        .ok()
+        .filter(|value| *value > 0)
+        .map(Some)
+        .ok_or(LiveKitConfigError::InvalidU64 { name, value })
+}
+
 pub fn linear16_samples_to_bytes(samples: &[i16]) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(samples.len() * 2);
     for sample in samples {
@@ -429,6 +547,20 @@ fn truncate_to_complete_channels(samples: &mut Vec<i16>, channels: u32) {
     let channels = channels as usize;
     let complete_samples = samples.len() / channels * channels;
     samples.truncate(complete_samples);
+}
+
+#[cfg(any(feature = "livekit-transport", test))]
+fn frame_has_speech(samples: &[i16], speech_threshold: u32) -> bool {
+    if samples.is_empty() {
+        return false;
+    }
+
+    let average_abs = samples
+        .iter()
+        .map(|sample| sample.unsigned_abs() as u64)
+        .sum::<u64>()
+        / samples.len() as u64;
+    average_abs >= speech_threshold as u64
 }
 
 #[cfg(feature = "livekit-transport")]
@@ -494,5 +626,13 @@ mod tests {
         truncate_to_complete_channels(&mut samples, 2);
 
         assert_eq!(samples, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn frame_has_speech_uses_average_absolute_sample_energy() {
+        assert!(!frame_has_speech(&[], 250));
+        assert!(!frame_has_speech(&[0, 10, -10, 20], 250));
+        assert!(frame_has_speech(&[300, -400, 500, -600], 250));
+        assert!(frame_has_speech(&[i16::MIN], 250));
     }
 }

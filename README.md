@@ -66,6 +66,8 @@ Optional env vars:
 - `LIVEKIT_ROOM` defaults to `ai-runtime`
 - `LIVEKIT_IDENTITY` defaults to `ai-runtime-agent`
 - `LIVEKIT_INPUT_SAMPLE_RATE`/`LIVEKIT_INPUT_CHANNELS` default to 16kHz mono
+- `LIVEKIT_INPUT_SPEECH_THRESHOLD` defaults to `250`; lower it if quiet speech does not start a turn, raise it if room noise starts turns
+- `LIVEKIT_INPUT_SILENCE_TIMEOUT_MS` defaults to `700`
 - `LIVEKIT_OUTPUT_SAMPLE_RATE`/`LIVEKIT_OUTPUT_CHANNELS` default to 24kHz mono
 
 The CLI prints structured runtime events for lifecycle state, LLM first-token latency, tool dispatch start/end, tool timeouts, and turn completion. Press Ctrl-C during a turn to cancel the in-flight LLM stream or tool call.
@@ -76,7 +78,7 @@ The voice library also exposes `VoiceSession`, which owns conversation state for
 
 `VoiceTransport` is the boundary for real-time audio transport. The included `FakeVoiceTransport` can inject user audio turns, capture outgoing TTS events, and exercise disconnect behavior without LiveKit or provider credentials.
 
-`LiveKitVoiceTransport` is available behind the `livekit-transport` feature. It joins a room with a generated LiveKit token, turns subscribed remote audio tracks into runtime audio turns, publishes an `assistant-audio` track, and writes linear16 TTS chunks into that track.
+`LiveKitVoiceTransport` is available behind the `livekit-transport` feature. It joins a room with a generated LiveKit token, segments subscribed remote audio tracks into repeated runtime audio turns, publishes an `assistant-audio` track, and writes linear16 TTS chunks into that track.
 
 ## Voice latency metrics
 

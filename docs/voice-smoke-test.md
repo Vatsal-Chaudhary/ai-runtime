@@ -31,6 +31,7 @@ Use this checklist when wiring a real LiveKit transport and hosted STT/TTS adapt
 5. Start the room bridge with `cargo run --features livekit-transport -- voice-livekit`.
 6. Join the same `LIVEKIT_ROOM` from another LiveKit client with a microphone.
 7. Confirm incoming mic audio creates transcript events and assistant audio publishes as the `assistant-audio` track.
+8. Speak a second request without reconnecting the browser participant and confirm another `stt_final` event is emitted.
 
 ## Happy Path
 
