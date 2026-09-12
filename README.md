@@ -4,7 +4,7 @@ Functional design document: [docs/fdd.md](docs/fdd.md)
 
 Manual voice provider smoke test: [docs/voice-smoke-test.md](docs/voice-smoke-test.md)
 
-Status: Voice runtime fake pipeline in progress
+Status: LiveKit + Deepgram voice bridge working, with best-effort barge-in cancellation
 
 ## CLI demo
 
@@ -100,6 +100,26 @@ Measurement boundaries:
 - `tts_first_audio`: TTS text stream start to first audio event
 - `voice_turn_round_trip`: audio stream start to completed voice turn
 
+Manual LiveKit + Deepgram smoke run:
+
+| Metric | Samples | p50 | p95 |
+|---|---:|---:|---:|
+| STT finalization | 6 | 3440 ms | 4672 ms |
+| LLM first token | 6 | 547 ms | 604 ms |
+| TTS first audio | 6 | 1026 ms | 1526 ms |
+| Voice round trip | 6 | 7968 ms | 10321 ms |
+
+Raw turn data from the same run:
+
+| Turn | Prompt | STT final | LLM first token | TTS first audio | Round trip |
+|---:|---|---:|---:|---:|---:|
+| 1 | say hello in one sentence | 3440 ms | 599 ms | 1026 ms | 5430 ms |
+| 2 | what is rust in one sentence | 3544 ms | 547 ms | 1526 ms | 7968 ms |
+| 3 | give me one benefit of async programming | 3387 ms | 567 ms | 1179 ms | 10154 ms |
+| 4 | what is a websocket in one sentence | 4012 ms | 525 ms | 963 ms | 9515 ms |
+| 5 | tell me one advantage of using rust for backend systems | 4672 ms | 346 ms | 1006 ms | 10321 ms |
+| 6 | say hello in one sentence | 2455 ms | 604 ms | 1111 ms | 4510 ms |
+
 ## Failure modes covered
 
 - Cancelling during LLM streaming stops token forwarding into TTS.
@@ -107,7 +127,8 @@ Measurement boundaries:
 - Cancelling during STT streaming drops the active STT stream.
 - Interrupted voice turns do not commit partial assistant output.
 - Dropped fake transport cancels the active turn without panicking.
+- LiveKit barge-in emits interruption/cancellation events; already-buffered browser/LiveKit audio may drain briefly after cancellation.
 
 ## Remaining provider work
 
-The core runtime and fake backends are runnable without credentials. Deepgram STT/TTS adapters and a feature-gated LiveKit transport are available for provider smoke tests. Real LiveKit audio requires `clang++` 21+ to build the WebRTC binding and still needs a manual mic/speaker smoke test.
+The core runtime and fake backends are runnable without credentials. Deepgram STT/TTS adapters and a feature-gated LiveKit transport are available for provider smoke tests. Real LiveKit audio requires `clang++` 21+ to build the WebRTC binding. Further polish should focus on README/demo packaging and tighter LiveKit playback interruption.
