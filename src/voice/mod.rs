@@ -398,7 +398,15 @@ where
         tts_events: UnboundedSender<TtsEvent>,
     ) -> std::result::Result<(), VoiceSessionError> {
         self.interrupt_active_turn().await?;
+        self.spawn_audio_turn(audio, tts_events);
+        Ok(())
+    }
 
+    fn spawn_audio_turn(
+        &mut self,
+        audio: BoxStream<'static, AudioChunk>,
+        tts_events: UnboundedSender<TtsEvent>,
+    ) {
         let pipeline = Arc::clone(&self.pipeline);
         let context = Arc::clone(&self.context);
         let cancellation_token = CancellationToken::new();
@@ -417,7 +425,6 @@ where
             started_at: Instant::now(),
             task,
         });
-        Ok(())
     }
 
     pub async fn finish_active_turn(
@@ -458,7 +465,8 @@ where
         loop {
             match transport.next_event().await {
                 Some(VoiceTransportEvent::AudioTurn(audio)) => {
-                    self.start_audio_turn(audio, transport.tts_events()).await?;
+                    self.interrupt_active_transport_turn().await?;
+                    self.spawn_audio_turn(audio, transport.tts_events());
                 }
                 Some(VoiceTransportEvent::Closed) => {
                     let _ = self.finish_active_turn().await?;
@@ -492,6 +500,16 @@ where
             Ok(_) => Ok(()),
             Err(VoiceTurnError::Cancelled) if was_running => Ok(()),
             Err(err) => Err(VoiceSessionError::VoiceTurn(err)),
+        }
+    }
+
+    async fn interrupt_active_transport_turn(
+        &mut self,
+    ) -> std::result::Result<(), VoiceSessionError> {
+        match self.interrupt_active_turn().await {
+            Ok(()) => Ok(()),
+            Err(VoiceSessionError::VoiceTurn(VoiceTurnError::MissingFinalTranscript)) => Ok(()),
+            Err(err) => Err(err),
         }
     }
 }
@@ -1572,6 +1590,48 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, VoiceEvent::VoiceTurnInterrupted { .. })),
             "transport barge-in should emit interruption: {voice_events:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fake_transport_skips_missing_transcript_segment_and_runs_next_turn() {
+        let provider = StaticTokenProvider::new(vec!["valid ", "turn"]);
+        let mut session = VoiceSession::new(
+            provider,
+            ToolRegistry::new(),
+            RuntimeConfig::new("test"),
+            FakeSpeechToText::new(),
+            FakeTextToSpeech::new(),
+            ConversationContext::new(),
+        );
+        let (transport, mut handle) = FakeVoiceTransport::new();
+
+        let result = {
+            let run = session.run_transport(transport);
+            tokio::pin!(run);
+
+            handle
+                .send_audio_turn(Vec::new())
+                .expect("empty transport segment should send");
+            handle
+                .send_audio_turn(vec![AudioChunk::new("real input").with_elapsed_ms(10)])
+                .expect("valid transport segment should send");
+            handle.close().expect("transport should close gracefully");
+
+            timeout(Duration::from_secs(1), &mut run)
+                .await
+                .expect("transport runner should finish")
+        };
+
+        result.expect("empty no-transcript segment should not kill transport");
+
+        let context = session.context_snapshot().await;
+        assert_eq!(
+            context
+                .messages()
+                .last()
+                .map(|message| (message.role.as_str(), message.content.as_str())),
+            Some(("assistant", "valid turn"))
         );
     }
 

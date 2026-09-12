@@ -67,6 +67,7 @@ Optional env vars:
 - `LIVEKIT_IDENTITY` defaults to `ai-runtime-agent`
 - `LIVEKIT_INPUT_SAMPLE_RATE`/`LIVEKIT_INPUT_CHANNELS` default to 16kHz mono
 - `LIVEKIT_INPUT_SPEECH_THRESHOLD` defaults to `250`; lower it if quiet speech does not start a turn, raise it if room noise starts turns
+- `LIVEKIT_INPUT_MIN_SPEECH_MS` defaults to `120`; raise it if noise creates empty turns
 - `LIVEKIT_INPUT_SILENCE_TIMEOUT_MS` defaults to `700`
 - `LIVEKIT_OUTPUT_SAMPLE_RATE`/`LIVEKIT_OUTPUT_CHANNELS` default to 24kHz mono
 

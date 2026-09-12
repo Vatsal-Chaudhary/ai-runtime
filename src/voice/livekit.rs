@@ -20,7 +20,7 @@ use {
             prelude::{AudioFrame, AudioSourceOptions, RtcAudioSource},
         },
     },
-    std::sync::Arc,
+    std::{collections::VecDeque, sync::Arc},
     tokio::{
         sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel},
         task::JoinHandle,
@@ -34,6 +34,7 @@ const DEFAULT_NAME: &str = "ai-runtime agent";
 const DEFAULT_INPUT_SAMPLE_RATE: u32 = 16_000;
 const DEFAULT_INPUT_CHANNELS: u32 = 1;
 const DEFAULT_INPUT_SPEECH_THRESHOLD: u32 = 250;
+const DEFAULT_INPUT_MIN_SPEECH_MS: u64 = 120;
 const DEFAULT_INPUT_SILENCE_TIMEOUT_MS: u64 = 700;
 const DEFAULT_OUTPUT_SAMPLE_RATE: u32 = 24_000;
 const DEFAULT_OUTPUT_CHANNELS: u32 = 1;
@@ -50,6 +51,7 @@ pub struct LiveKitConfig {
     pub input_sample_rate: u32,
     pub input_channels: u32,
     pub input_speech_threshold: u32,
+    pub input_min_speech_duration: Duration,
     pub input_silence_timeout: Duration,
     pub output_sample_rate: u32,
     pub output_channels: u32,
@@ -72,6 +74,7 @@ impl LiveKitConfig {
             input_sample_rate: DEFAULT_INPUT_SAMPLE_RATE,
             input_channels: DEFAULT_INPUT_CHANNELS,
             input_speech_threshold: DEFAULT_INPUT_SPEECH_THRESHOLD,
+            input_min_speech_duration: Duration::from_millis(DEFAULT_INPUT_MIN_SPEECH_MS),
             input_silence_timeout: Duration::from_millis(DEFAULT_INPUT_SILENCE_TIMEOUT_MS),
             output_sample_rate: DEFAULT_OUTPUT_SAMPLE_RATE,
             output_channels: DEFAULT_OUTPUT_CHANNELS,
@@ -96,6 +99,9 @@ impl LiveKitConfig {
             optional_u32_env("LIVEKIT_INPUT_CHANNELS")?.unwrap_or(DEFAULT_INPUT_CHANNELS);
         config.input_speech_threshold = optional_u32_env("LIVEKIT_INPUT_SPEECH_THRESHOLD")?
             .unwrap_or(DEFAULT_INPUT_SPEECH_THRESHOLD);
+        config.input_min_speech_duration = Duration::from_millis(
+            optional_u64_env("LIVEKIT_INPUT_MIN_SPEECH_MS")?.unwrap_or(DEFAULT_INPUT_MIN_SPEECH_MS),
+        );
         config.input_silence_timeout = Duration::from_millis(
             optional_u64_env("LIVEKIT_INPUT_SILENCE_TIMEOUT_MS")?
                 .unwrap_or(DEFAULT_INPUT_SILENCE_TIMEOUT_MS),
@@ -129,8 +135,14 @@ impl LiveKitConfig {
         self
     }
 
-    pub fn with_input_vad(mut self, speech_threshold: u32, silence_timeout: Duration) -> Self {
+    pub fn with_input_vad(
+        mut self,
+        speech_threshold: u32,
+        min_speech_duration: Duration,
+        silence_timeout: Duration,
+    ) -> Self {
         self.input_speech_threshold = speech_threshold;
+        self.input_min_speech_duration = min_speech_duration;
         self.input_silence_timeout = silence_timeout;
         self
     }
@@ -338,15 +350,17 @@ async fn remote_audio_turn_task(
     while let Some(frame) = stream.next().await {
         let frame_ms = audio_frame_elapsed_ms(frame.sample_rate, frame.samples_per_channel);
         let speech = frame_has_speech(frame.data.as_ref(), config.input_speech_threshold);
-        let Some((chunk, close_after_send)) =
+        let Some((chunks, close_after_send)) =
             active_turn.push_frame(frame, frame_ms, speech, &config, &input_tx)
         else {
             continue;
         };
 
-        if active_turn.send_chunk(chunk).is_err() {
-            active_turn.close();
-            continue;
+        for chunk in chunks {
+            if active_turn.send_chunk(chunk).is_err() {
+                active_turn.close();
+                break;
+            }
         }
 
         if close_after_send {
@@ -359,8 +373,16 @@ async fn remote_audio_turn_task(
 #[derive(Default)]
 struct ActiveLiveKitAudioTurn {
     tx: Option<UnboundedSender<AudioChunk>>,
+    pending: VecDeque<PendingLiveKitFrame>,
+    pending_speech_ms: u128,
     elapsed_ms: u128,
     silence_ms: u128,
+}
+
+#[cfg(feature = "livekit-transport")]
+struct PendingLiveKitFrame {
+    bytes: Vec<u8>,
+    frame_ms: u128,
 }
 
 #[cfg(feature = "livekit-transport")]
@@ -372,9 +394,22 @@ impl ActiveLiveKitAudioTurn {
         speech: bool,
         config: &LiveKitConfig,
         input_tx: &UnboundedSender<VoiceTransportEvent>,
-    ) -> Option<(AudioChunk, bool)> {
+    ) -> Option<(Vec<AudioChunk>, bool)> {
+        let pending_frame = PendingLiveKitFrame {
+            bytes: linear16_samples_to_bytes(frame.data.as_ref()),
+            frame_ms,
+        };
+
         if self.tx.is_none() {
             if !speech {
+                self.pending.clear();
+                self.pending_speech_ms = 0;
+                return None;
+            }
+
+            self.pending_speech_ms += frame_ms;
+            self.pending.push_back(pending_frame);
+            if self.pending_speech_ms < config.input_min_speech_duration.as_millis() {
                 return None;
             }
 
@@ -388,6 +423,9 @@ impl ActiveLiveKitAudioTurn {
             self.tx = Some(turn_tx);
             self.elapsed_ms = 0;
             self.silence_ms = 0;
+
+            let chunks = self.drain_pending_chunks();
+            return Some((chunks, false));
         }
 
         self.elapsed_ms += frame_ms;
@@ -398,13 +436,28 @@ impl ActiveLiveKitAudioTurn {
         }
 
         let chunk = AudioChunk {
-            bytes: linear16_samples_to_bytes(frame.data.as_ref()),
+            bytes: pending_frame.bytes,
             elapsed_ms: self.elapsed_ms,
         };
         let close_after_send =
             !speech && self.silence_ms >= config.input_silence_timeout.as_millis();
 
-        Some((chunk, close_after_send))
+        Some((vec![chunk], close_after_send))
+    }
+
+    fn drain_pending_chunks(&mut self) -> Vec<AudioChunk> {
+        let mut chunks = Vec::with_capacity(self.pending.len());
+
+        while let Some(frame) = self.pending.pop_front() {
+            self.elapsed_ms += frame.frame_ms;
+            chunks.push(AudioChunk {
+                bytes: frame.bytes,
+                elapsed_ms: self.elapsed_ms,
+            });
+        }
+        self.pending_speech_ms = 0;
+
+        chunks
     }
 
     fn send_chunk(&self, chunk: AudioChunk) -> std::result::Result<(), AudioChunk> {
@@ -416,6 +469,8 @@ impl ActiveLiveKitAudioTurn {
 
     fn close(&mut self) {
         self.tx = None;
+        self.pending.clear();
+        self.pending_speech_ms = 0;
         self.elapsed_ms = 0;
         self.silence_ms = 0;
     }
@@ -634,5 +689,62 @@ mod tests {
         assert!(!frame_has_speech(&[0, 10, -10, 20], 250));
         assert!(frame_has_speech(&[300, -400, 500, -600], 250));
         assert!(frame_has_speech(&[i16::MIN], 250));
+    }
+
+    #[cfg(feature = "livekit-transport")]
+    #[test]
+    fn active_turn_waits_for_minimum_speech_before_opening_stream() {
+        let config = LiveKitConfig::new("wss://example.livekit.cloud", "devkey", "secret")
+            .with_input_vad(250, Duration::from_millis(30), Duration::from_millis(700));
+        let (input_tx, mut input_rx) = unbounded_channel();
+        let mut turn = ActiveLiveKitAudioTurn::default();
+
+        let first = AudioFrame {
+            data: [500i16].as_slice().into(),
+            sample_rate: 16_000,
+            num_channels: 1,
+            samples_per_channel: 160,
+        };
+        assert!(
+            turn.push_frame(first, 10, true, &config, &input_tx)
+                .is_none()
+        );
+        assert!(input_rx.try_recv().is_err());
+
+        let second = AudioFrame {
+            data: [600i16].as_slice().into(),
+            sample_rate: 16_000,
+            num_channels: 1,
+            samples_per_channel: 160,
+        };
+        assert!(
+            turn.push_frame(second, 10, true, &config, &input_tx)
+                .is_none()
+        );
+        assert!(input_rx.try_recv().is_err());
+
+        let third = AudioFrame {
+            data: [700i16].as_slice().into(),
+            sample_rate: 16_000,
+            num_channels: 1,
+            samples_per_channel: 160,
+        };
+        let (chunks, close_after_send) = turn
+            .push_frame(third, 10, true, &config, &input_tx)
+            .expect("minimum speech should open a turn");
+
+        assert!(!close_after_send);
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(
+            chunks
+                .iter()
+                .map(|chunk| chunk.elapsed_ms)
+                .collect::<Vec<_>>(),
+            vec![10, 20, 30]
+        );
+        assert!(matches!(
+            input_rx.try_recv(),
+            Ok(VoiceTransportEvent::AudioTurn(_))
+        ));
     }
 }
