@@ -1,7 +1,5 @@
 A streaming LLM orchestration + tool-calling + voice runtime with cancellation-aware turn-taking, built directly against provider APIs in Rust. No LangChain, no Pipecat, no agent framework dependency.
 
-Manual voice provider smoke test: [docs/voice-smoke-test.md](docs/voice-smoke-test.md)
-
 Status: LiveKit + Deepgram voice bridge working, with best-effort barge-in cancellation.
 
 ## Architecture
@@ -16,14 +14,22 @@ Status: LiveKit + Deepgram voice bridge working, with best-effort barge-in cance
 
 Runtime shape:
 
-```text
-LiveKit mic audio
-  -> VoiceTransport
-  -> SpeechToText
-  -> AgentRuntime
-  -> RuntimeTtsAdapter
-  -> TextToSpeech
-  -> LiveKit assistant audio track
+```mermaid
+flowchart LR
+    User[Browser participant] -->|mic audio| LK[LiveKit transport]
+    LK -->|audio turns| STT[SpeechToText trait]
+    STT -->|final transcript| Runtime[AgentRuntime]
+    Runtime -->|tool calls| Tools[Tool registry]
+    Tools -->|tool results| Runtime
+    Runtime -->|assistant token stream| Adapter[RuntimeTtsAdapter]
+    Adapter -->|text stream| TTS[TextToSpeech trait]
+    TTS -->|audio chunks| LK
+    LK -->|assistant audio track| User
+
+    Runtime --> Events[latency + lifecycle events]
+    LK -->|speech started| Cancel[cancellation token]
+    Cancel --> Runtime
+    Cancel --> Adapter
 ```
 
 The core behavior is implemented in Rust. LiveKit, Deepgram, and the LLM provider are integrated as external providers rather than reimplemented.
